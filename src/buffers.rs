@@ -5,8 +5,8 @@
 //!
 //! One function per reference function, in call order:
 //! - [`infer_clock_buffer_list`] — `Resizer::inferClockBufferList` (with `isClockCellCandidate`),
-//!   reached from `TritonCTS::setBufferList` when the list is empty;
-//! - [`select_root_buffer`] / [`select_sink_buffer`] — `TritonCTS::selectRootBuffer` /
+//!   reached from `setBufferList` when the list is empty;
+//! - [`select_root_buffer`] / [`select_sink_buffer`] — `selectRootBuffer` /
 //!   `selectSinkBuffer`, each through [`select_best_max_cap_buffer`];
 //! - [`finalize_root_sink_buffers`] — `TechChar::finalizeRootSinkBuffers`;
 //! - [`trim_sort_buffer_list`] — `TechChar::trimSortBufferList`;
@@ -130,7 +130,7 @@ pub fn infer_clock_buffer_list(o: &Options, log: &mut Log, libs: &dyn BufferLibs
     Ok(names)
 }
 
-/// `TritonCTS::setBufferList(buffers)`: the given names (each a master, CTS-0126), or — given
+/// `setBufferList(buffers)`: the given names (each a master, CTS-0126), or — given
 /// none — the inferred list, marked inferred.
 pub fn set_buffer_list(o: &mut Options, log: &mut Log, libs: &dyn BufferLibs, buffers: &str) -> Res<()> {
     let list = crate::options::words(buffers);

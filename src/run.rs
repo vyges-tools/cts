@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The command and its sequence: `clock_tree_synthesis` (the Tcl proc: its options, in its order)
-//! and `TritonCTS::runTritonCts`, each stage its own function, in the reference's order.
+//! and `runTritonCts`, each stage its own function, in the reference's order.
 //!
 //! Modelled so far (slice 1): the setup up to the characterization buffer, clock-net discovery,
 //! and the run that finds no clock net. A run that finds one stops after discovery
@@ -133,7 +133,7 @@ pub fn clock_tree_synthesis(o: &mut Options, log: &mut Log, d: &mut dyn Design, 
     run_triton_cts(o, log, d)
 }
 
-/// `TritonCTS::runTritonCts`, as far as it is modelled.
+/// `runTritonCts`, as far as it is modelled.
 pub fn run_triton_cts(o: &mut Options, log: &mut Log, d: &mut dyn Design) -> Res<Outcome> {
     let (root, sink) = setup_characterization(o, log, d)?;
     find_clock_roots(o, log);

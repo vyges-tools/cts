@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Clock nets and their sinks: `TritonCTS::populateTritonCTS`.
+//! Clock nets and their sinks: `populateTritonCTS`.
 //!
 //! One function per reference function, in call order:
 //! - [`find_clk_nets`] — `dbSta::findClkNets` (the clock network: every pin a clock reaches
@@ -140,7 +140,7 @@ fn is_reg_clk(cell: &Cell, port: &str) -> bool {
     cell.arc_sets.iter().any(|a| a.from == port && matches!(a.role, Role::RegClkToQ | Role::LatchEnToQ))
 }
 
-/// `TritonCTS::isSink`: no liberty cell, a block, or a register clock port.
+/// `isSink`: no liberty cell, a block, or a register clock port.
 pub fn is_sink(d: &dyn ClockDesign, t: &ITerm) -> bool {
     let Some(cell) = d.liberty_cell(&d.inst_master(&t.0)) else { return true };
     if d.inst_is_block(&t.0) {

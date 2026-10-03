@@ -8,13 +8,13 @@
 use crate::log::{Log, Res};
 use std::collections::BTreeMap;
 
-/// The engine-level state the procs write (`TritonCTS` members and `CtsOptions`).
+/// The engine-level state the procs write (the engine's members and `CtsOptions`).
 #[derive(Debug, Clone)]
 pub struct Options {
     /// `CtsOptions::bufferList_` and whether it was inferred (`setBufferListInferred`).
     pub buffer_list: Vec<String>,
     pub buffer_list_inferred: bool,
-    /// `TritonCTS::rootBuffers_` / `sinkBuffers_` (cleared at the end of each run).
+    /// `rootBuffers_` / `sinkBuffers_` (cleared at the end of each run).
     pub root_buffers: Vec<String>,
     pub sink_buffers: Vec<String>,
     /// `-library` (`isCtsLibrarySet`).
@@ -131,7 +131,7 @@ pub trait Masters {
     fn has_master(&self, name: &str) -> bool;
 }
 
-/// `TritonCTS::setRootBuffer`: each name must be a master (CTS-0127).
+/// `setRootBuffer`: each name must be a master (CTS-0127).
 pub fn set_root_buffer(o: &mut Options, log: &mut Log, m: &dyn Masters, buffers: &str) -> Res<()> {
     let list = words(buffers);
     for b in &list {

@@ -336,7 +336,7 @@ fn run(job: &Value) -> Result<Value, String> {
         let u = l.units.ok_or("RC before a liberty library: the timer's default units are not modelled")?;
         Ok(vyges_est::rc::Units { resistance: u.resistance, capacitance: u.capacitance, distance: u.distance })
     };
-    let finish = |log: Log, pre: &[String], stop: Option<String>, outcome: Option<&str>| json!({"before": pre, "lines": log.lines, "stop": stop, "outcome": outcome});
+    let finish = |log: Log, pre: &[String], status: &str, reason: Option<String>| json!({"tool": "vyges-cts", "status": status, "reason": reason, "before": pre, "lines": log.lines});
     for step in job["steps"].as_array().ok_or("steps")? {
         let cmd = step["cmd"].as_str().ok_or("cmd")?;
         let args: Vec<String> = step["args"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
@@ -419,17 +419,31 @@ fn run(job: &Value) -> Result<Value, String> {
         })();
         match r {
             Ok(None) => {}
-            Ok(Some(Outcome::NoClockNets)) => return Ok(finish(log, &pre, None, Some("no_clock_nets"))),
+            // No clock net: the command's whole output, nothing to build — checked (clock_nets 0).
+            Ok(Some(Outcome::NoClockNets)) => {
+                let mut v = finish(log, &pre, "up_to_date", None);
+                v["clock_nets"] = json!(0);
+                return Ok(v);
+            }
+            // Clock nets found: what is modelled ends here (`modelled_through`); the trees are not
+            // built, so the command is refused rather than reported as done.
             Ok(Some(Outcome::Discovered(f))) => {
-                let mut v = finish(log, &pre, None, Some("discovered"));
+                let mut v = finish(log, &pre, "refused", Some("characterization and clock tree building are not modelled yet".into()));
+                v["modelled_through"] = json!("discovery");
+                v["clock_nets"] = json!(f.builders.len());
                 v["builders"] = json!(f.builders.iter().map(|b| json!({"net": b.net, "input_net": b.input_net, "clock": b.sdc_clock, "sinks": b.sinks.len(), "parent": b.parent, "tree_type": b.tree_type})).collect::<Vec<_>>());
                 return Ok(v);
             }
-            Err(Stop::Error { tool, id }) => return Ok(finish(log, &pre, Some(format!("error {tool}-{id:04}")), None)),
-            Err(Stop::Refused(why)) => return Ok(finish(log, &pre, Some(format!("refused: {why}")), None)),
+            Err(Stop::Error { tool, id }) => {
+                let mut v = finish(log, &pre, "error", Some(format!("{tool}-{id:04}")));
+                v["code"] = json!(format!("{tool}-{id:04}"));
+                return Ok(v);
+            }
+            Err(Stop::Refused(why)) => return Ok(finish(log, &pre, "refused", Some(why))),
         }
     }
-    Ok(finish(log, &pre, Some("refused: no clock_tree_synthesis step".into()), None))
+    // No clock_tree_synthesis step: nothing was checked.
+    Ok(finish(log, &pre, "vacuous", Some("the job has no clock_tree_synthesis step".into())))
 }
 
 struct MastersOf<'a>(&'a CliDesign);
@@ -440,24 +454,192 @@ impl vyges_cts::options::Masters for MastersOf<'_> {
     }
 }
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let Some(path) = args.get(1) else {
-        eprintln!("usage: vyges-cts <job.json>");
-        std::process::exit(2);
-    };
-    let job: Value = match std::fs::read_to_string(path).map_err(|e| e.to_string()).and_then(|t| serde_json::from_str(&t).map_err(|e| e.to_string())) {
-        Ok(j) => j,
-        Err(e) => {
-            eprintln!("{path}: {e}");
-            std::process::exit(2);
+const USAGE: &str = "\
+vyges loom cts — clock tree synthesis of a placed design: the clock buffers chosen, each clock net
+found and its sinks collected (the trees themselves are not built yet)
+
+USAGE:
+  vyges loom cts clock_tree_synthesis <job.json> [-o FILE]
+  vyges loom cts --describe
+  vyges loom cts --help
+  vyges loom cts --version
+
+JOB FIELDS:
+  steps        required — the commands in order, each {\"cmd\": ..., \"args\": [...]}, as a flow
+               script passes them: read_db, read_liberty, set_wire_rc, set_layer_rc,
+               set_dont_use, set_debug_level, read_sdc, set_cts_config, then
+               clock_tree_synthesis [options]
+
+MODELLED:
+  the buffer list (given, or inferred from the libraries), the root, sink and characterization
+  buffers, clock-gate cloning, every clock net and its sinks (CTS-0049..0052, CTS-0007..0011,
+  CTS-0008, CTS-0082) — the report's lines are the command's own, in its order.
+  Not yet: characterization, the trees, dummy loads, latency balancing — a design with a clock
+  net is refused after discovery (modelled_through: discovery).
+
+OPTIONS:
+  -o FILE               write the JSON report to FILE instead of stdout
+  --json                accepted; the report is JSON either way
+  --describe            print a machine-readable JSON description of the command
+  --bug-report          file a bug (central: vyges/community)
+  --feature-request     request a feature (central)
+  --sponsor             sponsor Vyges (github.com/sponsors/vyges-ip)
+  --star                star this tool on GitHub
+
+EXIT STATUS:
+  0  up_to_date   clock nets were looked for and none was found: nothing to build
+  2  vacuous      the job has no clock_tree_synthesis step. NOT a pass.
+  2  error        usage, unreadable input, or an error the command raises (its line is reported)
+  3  refused      an input this engine does not model — or a clock tree to build — see `reason`
+";
+
+const PIN_TOKEN: &str = "@OPENROAD_PIN@";
+
+fn describe() -> String {
+    DESCRIBE.replace(PIN_TOKEN, vyges_opendb::OPENROAD_PIN)
+}
+
+const DESCRIBE: &str = r#"{
+  "schema": "vyges-tool-descriptor/1.1",
+  "openroad_pin": "@OPENROAD_PIN@",
+  "name": "cts",
+  "summary": "clock tree synthesis of a placed design: clock buffers chosen, clock nets found and their sinks collected",
+  "maturity": "experimental",
+  "provenance_limitations": [
+    "input_hash covers the argument vector, not the content of the job file or of the design files it names.",
+    "status is one of up_to_date, vacuous, refused or error. up_to_date means clock nets were looked for and none was found. A design WITH a clock net is refused after discovery (modelled_through: discovery): the trees are not built yet. The declared assertion passes on up_to_date only. Exit status is 0 for up_to_date, 2 for vacuous and for error, 3 for refused.",
+    "Modelled: buffer list inference, root/sink/characterization buffer selection, clock-gate cloning, clock-net discovery through gaters and bidirect pads. Refused rather than guessed: hierarchical designs where a clone or register-tree buffer is made, insertion-delay (clock-tree-path) cells, several corners, set_disable_timing, case analysis and generated clocks."
+  ],
+  "invocation": {
+    "args_template": ["clock_tree_synthesis", "{job}"],
+    "optional": [ { "arg": "out", "flag": "-o" } ],
+    "emits_json": true
+  },
+  "inputs": {
+    "type": "object",
+    "required": ["job"],
+    "properties": {
+      "job": { "type": "string", "description": "path to a JSON job: {steps: [{cmd, args}]}" },
+      "out": { "type": "string", "description": "write the JSON report to FILE instead of stdout" }
+    }
+  },
+  "consumes": ["job"],
+  "artifacts": [],
+  "assertion": {
+    "id": "clock-trees-built",
+    "field": "status",
+    "pass_when": { "in": ["up_to_date"] }
+  }
+}"#;
+
+fn link(flag: &str) -> Option<(&'static str, &'static str)> {
+    Some(match flag {
+        "--bug-report" => ("Report a bug", "https://github.com/vyges/community/issues/new?template=bug_report_template.yaml"),
+        "--feature-request" => ("Request a feature", "https://github.com/vyges/community/issues/new?labels=enhancement"),
+        "--sponsor" => ("Sponsor Vyges", "https://github.com/sponsors/vyges-ip"),
+        "--star" => ("Star this tool", "https://github.com/vyges-tools/cts"),
+        _ => return None,
+    })
+}
+
+fn exit_for(status: &str) -> u8 {
+    match status {
+        "up_to_date" => 0,
+        "refused" => 3,
+        _ => 2,
+    }
+}
+
+fn main() -> std::process::ExitCode {
+    use std::process::ExitCode;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut out: Option<String> = None;
+    let mut positional: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" => match args.get(i + 1) {
+                Some(v) => {
+                    out = Some(v.clone());
+                    i += 1;
+                }
+                None => {
+                    eprintln!("vyges-cts: -o needs a FILE");
+                    return ExitCode::from(2);
+                }
+            },
+            "--json" => {}
+            a if a.starts_with('-') && !positional.is_empty() => {
+                eprintln!("vyges-cts: unknown option {a}\n\n{USAGE}");
+                return ExitCode::from(2);
+            }
+            a => positional.push(a),
         }
-    };
-    match run(&job) {
-        Ok(v) => println!("{v}"),
-        Err(e) => {
-            eprintln!("{e}");
-            std::process::exit(1);
+        i += 1;
+    }
+    match positional.first().copied() {
+        None | Some("-h") | Some("--help") => {
+            print!("{USAGE}");
+            return ExitCode::SUCCESS;
         }
+        Some("-V") | Some("--version") => {
+            println!("vyges-cts {} ({})\nCopyright (c) Vyges. Apache-2.0.", env!("CARGO_PKG_VERSION"), env!("VYGES_GIT_SHA"));
+            return ExitCode::SUCCESS;
+        }
+        Some("--describe") => {
+            println!("{}", describe());
+            return ExitCode::SUCCESS;
+        }
+        Some(f) if link(f).is_some() => {
+            let (label, url) = link(f).expect("a link flag");
+            println!("{label}:\n  {url}");
+            return ExitCode::SUCCESS;
+        }
+        Some("clock_tree_synthesis") if positional.len() == 2 => {}
+        _ => {
+            eprint!("{USAGE}");
+            return ExitCode::from(2);
+        }
+    }
+    let path = positional[1];
+    let report = match std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}")).and_then(|t| serde_json::from_str::<Value>(&t).map_err(|e| format!("{path}: {e}"))) {
+        Err(e) => json!({ "tool": "vyges-cts", "status": "error", "reason": e }),
+        Ok(job) => match run(&job) {
+            Ok(r) => r,
+            Err(e) => json!({ "tool": "vyges-cts", "status": "error", "reason": e }),
+        },
+    };
+    let status = report["status"].as_str().unwrap_or("error").to_string();
+    let text = format!("{report}\n");
+    match &out {
+        Some(f) => {
+            if let Err(e) = std::fs::write(f, &text) {
+                eprintln!("vyges-cts: {f}: {e}");
+                return ExitCode::from(2);
+            }
+        }
+        None => print!("{text}"),
+    }
+    ExitCode::from(exit_for(&status))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_descriptor_is_valid_json_and_names_the_engine() {
+        let d: Value = serde_json::from_str(&describe()).expect("--describe must be valid JSON");
+        assert_eq!(d["name"], "cts");
+        assert_eq!(d["openroad_pin"].as_str().map(str::len), Some(40));
+    }
+
+    // Rule (vacuous convention): only a checked nothing-to-do exits 0; a refusal never does.
+    #[test]
+    fn only_up_to_date_exits_zero() {
+        assert_eq!(exit_for("up_to_date"), 0);
+        assert_eq!(exit_for("refused"), 3);
+        assert_eq!(exit_for("vacuous"), 2);
+        assert_eq!(exit_for("error"), 2);
     }
 }

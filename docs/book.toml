@@ -1,0 +1,14 @@
+[book]
+title = "vyges-cts"
+description = "Clock tree synthesis of a placed design: clock buffers chosen, clock nets found, gaters cloned"
+authors = ["Vyges"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "light"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/vyges-tools/cts"
+
+# The chapter (src/cts.md) and the CLI reference (src/reference/vyges-cts.md) are written to drop
+# into the Vyges book unchanged, as engines/cts.md and engines/reference/vyges-cts.md.
