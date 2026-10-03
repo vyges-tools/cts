@@ -1,0 +1,48 @@
+[package]
+name = "vyges-cts"
+version = "0.1.39"
+edition = "2021"
+description = "Clock tree synthesis of placed designs: the clock buffers chosen, each clock net found and its sinks collected, then an H-tree built and buffered per net."
+license = "Apache-2.0"
+authors = ["Vyges <https://vyges.com/contact>"]
+homepage = "https://vyges.com"
+
+[features]
+# The command-line engine: the database, the wire RC, the SDC reader, and JSON jobs.
+cli = ["dep:vyges-opendb", "dep:vyges-est", "dep:vyges-loom", "dep:serde_json"]
+
+[dependencies]
+# The timer's library model: cells, ports, arcs.
+vyges-sta = { git = "https://github.com/vyges-tools/sta.git", branch = "main" }
+vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "main", optional = true }
+vyges-est = { git = "https://github.com/vyges-tools/est.git", branch = "main", features = ["odb"], optional = true }
+vyges-loom = { git = "https://github.com/vyges-tools/loom.git", branch = "main", optional = true }
+serde_json = { version = "1", optional = true }
+
+[lib]
+name = "vyges_cts"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vyges-cts"
+path = "src/main.rs"
+required-features = ["cli"]
+
+# Local development against the sibling checkouts; a no-op for consumers pulling this by git.
+[patch."https://github.com/vyges-tools/opendb.git"]
+vyges-opendb = { path = "../vyges-tools-opendb" }
+
+[patch."https://github.com/vyges-tools/opendb-lib.git"]
+vyges-opendb-lib = { path = "../vyges-tools-opendb-lib" }
+
+[patch."https://github.com/vyges-tools/sta.git"]
+vyges-sta = { path = "../vyges-tools-sta" }
+
+[patch."https://github.com/vyges-tools/est.git"]
+vyges-est = { path = "../vyges-tools-est" }
+
+[patch."https://github.com/vyges-tools/loom.git"]
+vyges-loom = { path = "../vyges-tools-loom" }
+
+[patch."https://github.com/vyges-tools/layout"]
+vyges-layout = { path = "../vyges-tools-layout" }
