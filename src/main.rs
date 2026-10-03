@@ -15,6 +15,34 @@ use vyges_cts::run::{Design, Outcome};
 use vyges_opendb::Db;
 use vyges_sta::liberty::{Cell, Library};
 
+thread_local! {
+    static LUT: vyges_stt::flute::lut::Lut = vyges_stt::flute::lut::load_tables(vyges_stt::flute::lut::MAX_LUT_DEGREE).expect("flute tables");
+}
+
+/// Every LEF master: its site and the IMPLANT layers among its obstructions (the resizer's view).
+fn rsz_masters(db: &Db) -> Res<std::collections::BTreeMap<String, vyges_rsz::preamble::Master>> {
+    let e = |e: vyges_opendb::Error| Stop::Refused(format!("database: {e}"));
+    let mut out = std::collections::BTreeMap::new();
+    let mut layer_type: std::collections::BTreeMap<i64, (String, String)> = std::collections::BTreeMap::new();
+    for i in 0..db.num_masters().map_err(e)? {
+        let name = db.nth_master_name(i).map_err(e)?;
+        let mut implant_obs = Vec::new();
+        for (layer, ..) in db.master_obstruction_boxes(&name).map_err(e)? {
+            let (lname, ltype) = layer_type.entry(layer).or_insert_with(|| {
+                let lname = db.layer_name_by_number(layer);
+                let ltype = db.layer_get_type(&lname).unwrap_or_default();
+                (lname, ltype)
+            });
+            if ltype.eq_ignore_ascii_case("IMPLANT") && !implant_obs.contains(lname) {
+                implant_obs.push(lname.clone());
+            }
+        }
+        let area = i64::from(db.master_get_width(&name)) * i64::from(db.master_get_height(&name));
+        out.insert(name.clone(), vyges_rsz::preamble::Master { site: db.master_get_site(&name), area, is_core: db.master_is_core(&name), logic_std: db.master_get_type(&name).map_err(e)? == "CORE", implant_obs });
+    }
+    Ok(out)
+}
+
 /// A `get_lib_cells` glob: `*` and `?`.
 fn glob_match(pat: &str, s: &str) -> bool {
     let (p, t): (Vec<char>, Vec<char>) = (pat.chars().collect(), s.chars().collect());
@@ -57,6 +85,12 @@ struct CliDesign {
     tech: String,
     clocks: Vec<SdcClock>,
     dont_use: BTreeSet<String>,
+    /// `set_dont_use` alone (the resizer adds the liberty's own).
+    set_dont_use: BTreeSet<String>,
+    /// `set_routing_alpha` was given (not modelled for the Steiner trees).
+    routing_alpha_set: bool,
+    /// set_cts_config's clock buffer string or footprint (findBuffers' clock test reads it).
+    clock_buffer_pattern: bool,
     masters: HashSet<String>,
     /// `dbNet` ids by name (the block's net order).
     net_ids: HashMap<String, u32>,
@@ -150,6 +184,57 @@ impl ClockDesign for CliDesign {
     fn liberty_cell(&self, master: &str) -> Option<&Cell> {
         BufferLibs::liberty_cell(self, master)
     }
+    fn iterm_avg_xy(&self, t: &ITerm) -> Option<(i32, i32)> {
+        self.db.iterm_avg_xy(&t.0, &t.1)
+    }
+    fn inst_locations(&self) -> Vec<(i32, i32)> {
+        self.db.block_get_insts().iter().map(|i| (self.db.inst_get_location_x(i), self.db.inst_get_location_y(i))).collect()
+    }
+    fn has_hierarchy(&self) -> bool {
+        !self.db.block_get_mod_insts().is_empty()
+    }
+    fn steiner_tree(&self, net: &str, xs: &[i32], ys: &[i32], drvr: usize) -> Res<vyges_stt::Tree> {
+        if self.routing_alpha_set {
+            return vyges_cts::log::refuse("set_routing_alpha: the Steiner builder's alpha is not modelled");
+        }
+        // The builder's default alpha.
+        LUT.with(|lut| vyges_stt::make_steiner_tree(lut, xs, ys, drvr, 0.3).0).ok_or_else(|| Stop::Refused(format!("net {net}: no Steiner tree")))
+    }
+    fn make_clock_net(&mut self, name: &str) -> Res<String> {
+        let e = |e: vyges_opendb::Error| Stop::Refused(format!("clock net {name}: {e}"));
+        let name = self.db.make_new_net_name(name, "IF_NEEDED").map_err(e)?;
+        self.db.create_net(&name).map_err(e)?;
+        self.db.net_set_sig_type(&name, "CLOCK").map_err(e)?;
+        self.refresh();
+        Ok(name)
+    }
+    fn make_clone(&mut self, gater: &str, name: &str, net: &str) -> Res<()> {
+        let e = |e: vyges_opendb::Error| Stop::Refused(format!("clone {name}: {e}"));
+        let master = self.db.inst_get_master(gater);
+        self.db.create_inst(&master, name).map_err(e)?;
+        self.db.inst_set_source_type(name, "TIMING").map_err(e)?;
+        for t in self.inst_iterms(name) {
+            if self.iterm_is_input_signal(&t, true) {
+                if let Some(n) = some(self.db.iterm_get_net(gater, &t.1)) {
+                    self.db.connect(&t.0, &t.1, &n).map_err(e)?;
+                }
+            } else if self.iterm_is_output_signal(&t, true) {
+                self.db.connect(&t.0, &t.1, net).map_err(e)?;
+            }
+        }
+        self.refresh();
+        Ok(())
+    }
+    fn reconnect(&mut self, t: &ITerm, net: &str) -> Res<()> {
+        let e = |e: vyges_opendb::Error| Stop::Refused(format!("{}/{}: {e}", t.0, t.1));
+        self.db.disconnect(&t.0, &t.1).map_err(e)?;
+        self.db.connect(&t.0, &t.1, net).map_err(e)
+    }
+    fn place(&mut self, inst: &str, at: (i32, i32)) -> Res<()> {
+        let e = |e: vyges_opendb::Error| Stop::Refused(format!("{inst}: {e}"));
+        self.db.set_inst_location(inst, at.0, at.1).map_err(e)?;
+        self.db.inst_set_placement_status(inst, "PLACED").map_err(e)
+    }
     fn fork_register_net(&mut self, net: &str, sinks: &[ITerm], root_buffer: &str, top_buffer: &str) -> Res<String> {
         if !self.db.block_get_mod_insts().is_empty() {
             return vyges_cts::log::refuse("the register tree's buffer in a hierarchical design (its target module) is not modelled");
@@ -208,6 +293,33 @@ impl Design for CliDesign {
     fn sdc_clocks(&self) -> Vec<SdcClock> {
         self.clocks.clone()
     }
+    fn find_max_wire_length(&self) -> Res<f64> {
+        let v = self.rc.resolved(&self.tech, 0);
+        let rc = vyges_rsz::buffered_net::WireRc { h_res: v[0], v_res: v[1], h_cap: v[2], v_cap: v[3] };
+        // No scene with a signal resistance: -inf, before any buffer is looked at.
+        if self.rc.resolve(&self.tech, |w| &w.signal_res).is_empty() || (rc.h_res + rc.v_res) / 2.0 <= 0.0 {
+            return Ok(f64::NEG_INFINITY);
+        }
+        if self.clock_buffer_pattern {
+            return vyges_cts::log::refuse("findBuffers with a clock buffer string or footprint is not modelled");
+        }
+        let libs = vyges_rsz::preamble::Libs { libs: self.libs.clone(), scenes: Vec::new(), scene_libs: Vec::new() };
+        let masters = rsz_masters(&self.db)?;
+        let mut dont_use = self.set_dont_use.clone();
+        for lib in &self.libs {
+            dont_use.extend(lib.cells.values().filter(|c| c.dont_use).map(|c| c.name.clone()));
+        }
+        let buffers = vyges_rsz::preamble::find_buffers(&libs, &masters, &dont_use).map_err(|e| Stop::Refused(format!("findBuffers: {}", e.message())))?;
+        let (tgt_slews, _, _) = vyges_rsz::preamble::find_target_loads(&libs, &buffers.cells, &dont_use);
+        let mut master_pins = HashMap::new();
+        for m in &self.masters {
+            let terms = self.db.master_mterms(m).map_err(|e| Stop::Refused(format!("{m}: {e}")))?;
+            master_pins.insert(m.clone(), terms.into_iter().filter(|(_, t)| t != "POWER" && t != "GROUND").map(|(n, _)| n).collect());
+        }
+        let ctx = vyges_rsz::max_wire_length::Ctx { libs: &libs, buffers: &buffers.cells, tgt_slews, wire_rc: std::slice::from_ref(&rc), master_pins: &master_pins };
+        let mut lengths = Vec::new();
+        vyges_rsz::max_wire_length::find_max_wire_length(&ctx, &mut lengths).map_err(|e| Stop::Refused(format!("findMaxWireLength: {}", e.message())))
+    }
 }
 
 fn read_text(path: &str) -> Result<String, String> {
@@ -215,7 +327,7 @@ fn read_text(path: &str) -> Result<String, String> {
 }
 
 fn run(job: &Value) -> Result<Value, String> {
-    let mut d = CliDesign { db: Db::new(), libs: Vec::new(), rc: vyges_est::rc::Rc::new(), tech: String::new(), clocks: Vec::new(), dont_use: BTreeSet::new(), masters: HashSet::new(), net_ids: HashMap::new(), bterms: HashSet::new() };
+    let mut d = CliDesign { db: Db::new(), libs: Vec::new(), rc: vyges_est::rc::Rc::new(), tech: String::new(), clocks: Vec::new(), dont_use: BTreeSet::new(), set_dont_use: BTreeSet::new(), routing_alpha_set: false, clock_buffer_pattern: false, masters: HashSet::new(), net_ids: HashMap::new(), bterms: HashSet::new() };
     let mut liberty = vyges_est::liberty::LibertyClocks::default();
     let mut o = Options::default();
     let mut log = Log::default();
@@ -259,7 +371,9 @@ fn run(job: &Value) -> Result<Value, String> {
                                 return vyges_cts::log::refuse(format!("set_dont_use {pat}: not a plain cell pattern (not modelled)"));
                             }
                             for lib in &d.libs {
-                                d.dont_use.extend(lib.cells.keys().filter(|c| glob_match(pat, c)).cloned());
+                                let hits: Vec<String> = lib.cells.keys().filter(|c| glob_match(pat, c)).cloned().collect();
+                                d.dont_use.extend(hits.iter().cloned());
+                                d.set_dont_use.extend(hits);
                             }
                         }
                     }
@@ -286,7 +400,11 @@ fn run(job: &Value) -> Result<Value, String> {
                         })
                         .collect();
                 }
+                "set_routing_alpha" => d.routing_alpha_set = true,
                 "set_cts_config" => {
+                    if args.iter().any(|a| a.starts_with("-clock_buffer_")) {
+                        d.clock_buffer_pattern = true;
+                    }
                     let dd = &d;
                     vyges_cts::options::set_cts_config(&mut o, &mut log, &MastersOf(dd), &args, &mut |o, log, b| vyges_cts::buffers::set_buffer_list(o, log, dd, b))?;
                 }

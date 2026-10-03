@@ -13,7 +13,7 @@
 //!   [`separate_macro_reg_sinks`], then one tree (CTS-0010) or a macro tree and a register tree
 //!   behind a new buffer (CTS-0011 twice).
 
-use crate::log::{refuse, Log, Res};
+use crate::log::{refuse, Log, Res, Stop};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use vyges_sta::liberty::{Cell, Role};
 
@@ -66,6 +66,23 @@ pub trait ClockDesign {
     fn inst_is_timing_source(&self, inst: &str) -> bool;
     /// The liberty cell a master links to.
     fn liberty_cell(&self, master: &str) -> Option<&Cell>;
+    /// `dbITerm::getAvgXY`: the mean of the terminal's pin box centres, `None` without shapes.
+    fn iterm_avg_xy(&self, t: &ITerm) -> Option<(i32, i32)>;
+    /// Every instance's `getLocation()`.
+    fn inst_locations(&self) -> Vec<(i32, i32)>;
+    /// The block has a module hierarchy.
+    fn has_hierarchy(&self) -> bool;
+    /// `stt::makeSteinerTree(net, xs, ys, drvr)` with the net's routing alpha.
+    fn steiner_tree(&self, net: &str, xs: &[i32], ys: &[i32], drvr: usize) -> Res<vyges_stt::Tree>;
+    /// A CLOCK net named `name` (`makeNet(IF_NEEDED)`: uniquified only when taken); its name.
+    fn make_clock_net(&mut self, name: &str) -> Res<String>;
+    /// A `TIMING` instance `name` of `gater`'s master, each input on the gater's input nets in
+    /// its terminal order, its output on `net`.
+    fn make_clone(&mut self, gater: &str, name: &str, net: &str) -> Res<()>;
+    /// A load moved to `net` (disconnect, then connect).
+    fn reconnect(&mut self, t: &ITerm, net: &str) -> Res<()>;
+    /// `setLocation` + `PLACED`.
+    fn place(&mut self, inst: &str, at: (i32, i32)) -> Res<()>;
     /// `forkRegisterClockNetwork`'s edits: a CLOCK net `<net>_regs`, the register sinks moved to
     /// it, a `TIMING` buffer of the root master named `top_buffer` at the new net's terminal
     /// bounding-box centre, driven from `net`. Returns the new net's name.
@@ -80,6 +97,9 @@ pub struct Setup<'a> {
     pub insertion_delay: bool,
     pub buffer_list: &'a [String],
     pub root_buffer: &'a str,
+    /// `CtsOptions::getMaxWl` (DBU): the max wire length when the resizer found one, else 0 — or
+    /// why it could not be computed (read only by cloning).
+    pub max_wl: Res<i32>,
 }
 
 /// One clock tree to build (`TreeBuilder`): what slice 1 knows of it.
@@ -280,6 +300,8 @@ pub fn populate_triton_cts(d: &mut dyn ClockDesign, log: &mut Log, s: &Setup, cl
             info.push((nets, clk.name.clone()));
         }
     }
+    // Every instance's location, so a clone never lands on one (mapLocationToSink_ keys).
+    let mut occupied: BTreeSet<(i32, i32)> = d.inst_locations().into_iter().collect();
     let mut clone_visited: HashSet<String> = HashSet::new();
     for (nets, clk_name) in &info {
         for net in nets {
@@ -287,7 +309,7 @@ pub fn populate_triton_cts(d: &mut dyn ClockDesign, log: &mut Log, s: &Setup, cl
                 log.warn("CTS", 40, format!("Net was not found in the design for {clk_name}, please check. Skipping..."));
                 continue;
             };
-            clone_clock_gaters(d, &f, net, &mut clone_visited)?;
+            clone_clock_gaters(d, log, s, &mut f, net, &mut occupied, &mut clone_visited)?;
             if clk_name.is_empty() {
                 log.info("CTS", 95, format!("Net \"{net}\" found."));
             } else {
@@ -305,35 +327,208 @@ pub fn populate_triton_cts(d: &mut dyn ClockDesign, log: &mut Log, s: &Setup, cl
     Ok(f)
 }
 
-/// `cloneClockGaters`: the recursion through gaters is followed; a gater whose fanout reaches the
-/// Steiner tree (`findLongEdges`) is refused — the cloning is a later slice.
-fn clone_clock_gaters(d: &dyn ClockDesign, f: &Found, net: &str, visited: &mut HashSet<String>) -> Res<()> {
+/// `cloneClockGaters(clkNet, occupiedPositions, visitedNets)`: depth first through each non-sink,
+/// non-buffer, non-inverter load's clock output; then, for a net driven by a movable non-sink
+/// cell, the Steiner tree over its loads (`findLongEdges`).
+fn clone_clock_gaters(d: &mut dyn ClockDesign, log: &mut Log, s: &Setup, f: &mut Found, net: &str, occupied: &mut BTreeSet<(i32, i32)>, visited: &mut HashSet<String>) -> Res<()> {
     if !visited.insert(net.to_string()) {
-        return Ok(());
+        return Ok(()); // a cycle
     }
     let driver = d.net_first_output(net);
-    let mut any_load = false;
+    let (mut xs, mut ys) = (Vec::new(), Vec::new());
+    let mut point2pin: HashMap<(i32, i32), Vec<ITerm>> = HashMap::new();
     for t in d.net_iterms(net) {
         if Some(&t) == driver.as_ref() || !d.iterm_is_input_signal(&t, true) {
             continue;
         }
-        any_load = true;
+        let Some(p) = d.iterm_avg_xy(&t) else { return refuse(format!("{}/{}: no pin shapes (getAvgXY) is not modelled", t.0, t.1)) };
+        xs.push(p.0);
+        ys.push(p.1);
+        point2pin.entry(p).or_default().push(t.clone());
         if is_sink(d, &t) {
             continue;
         }
         let Some(out) = get_single_output(d, f, &t) else { continue };
         let Some(out_net) = d.iterm_net(&out) else { continue };
         let Some(cell) = d.liberty_cell(&d.inst_master(&t.0)) else { continue };
+        // Clock tree buffers and inverters are not gaters.
         if cell.is_inverter() || cell.is_buffer() {
             continue;
         }
-        clone_clock_gaters(d, f, &out_net, visited)?;
+        clone_clock_gaters(d, log, s, f, &out_net, occupied, visited)?;
     }
     let Some(drv) = driver else { return Ok(()) };
-    if is_sink(d, &drv) || d.inst_is_fixed(&drv.0) || d.inst_is_pad(&drv.0) || !any_load {
+    // xs is empty when the only load is a port.
+    if is_sink(d, &drv) || d.inst_is_fixed(&drv.0) || d.inst_is_pad(&drv.0) || xs.is_empty() {
         return Ok(());
     }
-    refuse(format!("net {net}: clock gate cloning (the Steiner tree over {}'s fanout) is not modelled", drv.0))
+    let Some(dp) = d.iterm_avg_xy(&drv) else { return refuse(format!("{}/{}: no pin shapes (getAvgXY) is not modelled", drv.0, drv.1)) };
+    point2pin.entry(dp).or_default().push(drv);
+    // ⚠️ The driver is not among the points: index 0 is the FIRST LOAD.
+    let tree = d.steiner_tree(net, &xs, &ys, 0)?;
+    find_long_edges(d, log, s, f, &tree, dp, &mut point2pin, occupied)
+}
+
+/// `odb::Point::manhattanDistance`.
+fn manhattan(a: (i32, i32), b: (i32, i32)) -> i64 {
+    (i64::from(a.0) - i64::from(b.0)).abs() + (i64::from(a.1) - i64::from(b.1)).abs()
+}
+
+/// A bounding box grown point by point (`Rect::mergeInit` / `merge`); its centre as odb's
+/// `xCenter`/`yCenter` (an empty one is `(0, 0)`: `INT_MAX + INT_MIN` halved).
+struct BBox(i32, i32, i32, i32);
+
+impl BBox {
+    fn new() -> BBox {
+        BBox(i32::MAX, i32::MAX, i32::MIN, i32::MIN)
+    }
+    fn merge(&mut self, p: (i32, i32)) {
+        self.0 = self.0.min(p.0);
+        self.1 = self.1.min(p.1);
+        self.2 = self.2.max(p.0);
+        self.3 = self.3.max(p.1);
+    }
+    fn center(&self) -> (i32, i32) {
+        (((i64::from(self.0) + i64::from(self.2)) / 2) as i32, ((i64::from(self.1) + i64::from(self.3)) / 2) as i32)
+    }
+}
+
+/// `findLongEdges`: the tree's branches grouped into clusters joined by edges shorter than the
+/// max wire length; the cluster nearest the driver keeps the gater, each other valid cluster gets
+/// a clone of it (new net `clonenet_<k>_<net>`, instance `clone_<k>_<gater>`), placed at its
+/// loads' centre.
+#[allow(clippy::too_many_arguments)]
+fn find_long_edges(d: &mut dyn ClockDesign, log: &mut Log, s: &Setup, f: &mut Found, tree: &vyges_stt::Tree, driver_pt: (i32, i32), point2pin: &mut HashMap<(i32, i32), Vec<ITerm>>, occupied: &mut BTreeSet<(i32, i32)>) -> Res<()> {
+    const G: &str = "clock gate cloning";
+    let threshold = i64::from(s.max_wl.clone()?);
+    log.debug("CTS", G, 1, || format!("Threshold = {threshold}"));
+    let mut iterm2cluster: HashMap<usize, usize> = HashMap::new();
+    let mut clusters: Vec<Vec<usize>> = Vec::new();
+    let first = point2pin[&driver_pt][0].clone();
+    let icg_net = d.iterm_net(&first).ok_or_else(|| Stop::Refused("the gater's first pin has no net".into()))?;
+    let icg_term = d.net_first_output(&icg_net).ok_or_else(|| Stop::Refused(format!("net {icg_net}: no driver")))?;
+    let icg_name = icg_term.0.clone();
+    for b in 0..tree.branch_count() {
+        let br = tree.branch[b];
+        let nb = tree.branch[br.n];
+        let dist = manhattan((br.x, br.y), (nb.x, nb.y));
+        let from = iterm2cluster.get(&b).copied();
+        let to = iterm2cluster.get(&br.n).copied();
+        if b == br.n {
+            continue;
+        }
+        if dist >= threshold {
+            if from.is_none() {
+                iterm2cluster.insert(b, clusters.len());
+                clusters.push(vec![b]);
+            }
+            if to.is_none() {
+                iterm2cluster.insert(br.n, clusters.len());
+                clusters.push(vec![br.n]);
+            }
+            continue;
+        }
+        match (from, to) {
+            (Some(cf), Some(ct)) => {
+                let kept = if clusters[cf].len() >= clusters[ct].len() { cf } else { ct };
+                let removed = if clusters[cf].len() < clusters[ct].len() { cf } else { ct };
+                // The removed cluster's points appended to the kept one, then it is emptied —
+                // also when both are the same cluster (it ends empty).
+                let moved = clusters[removed].clone();
+                clusters[kept].extend(moved.iter().copied());
+                let all = clusters[removed].clone();
+                for p in all {
+                    iterm2cluster.insert(p, kept);
+                }
+                clusters[removed].clear();
+            }
+            (Some(cf), None) => {
+                iterm2cluster.insert(br.n, cf);
+                clusters[cf].push(br.n);
+            }
+            (None, Some(ct)) => {
+                iterm2cluster.insert(b, ct);
+                clusters[ct].push(b);
+            }
+            (None, None) => {
+                iterm2cluster.insert(b, clusters.len());
+                iterm2cluster.insert(br.n, clusters.len());
+                clusters.push(vec![b, br.n]);
+            }
+        }
+    }
+    let pins_at = |point2pin: &mut HashMap<(i32, i32), Vec<ITerm>>, b: usize| point2pin.entry((tree.branch[b].x, tree.branch[b].y)).or_default().clone();
+    // The valid cluster (one with a load) nearest the driver.
+    let (mut driver_cluster, mut min_dist, mut valid) = (None, i64::MAX, 0);
+    for (n, cluster) in clusters.iter().enumerate() {
+        if cluster.is_empty() {
+            continue;
+        }
+        let (mut ok, mut bb) = (false, BBox::new());
+        for &b in cluster {
+            for t in pins_at(point2pin, b) {
+                if !d.iterm_is_input_signal(&t, true) {
+                    continue;
+                }
+                ok = true;
+                bb.merge(d.iterm_avg_xy(&t).expect("a load with shapes"));
+            }
+        }
+        if ok {
+            valid += 1;
+            let dist = manhattan(bb.center(), driver_pt);
+            if dist < min_dist {
+                driver_cluster = Some(n);
+                min_dist = dist;
+            }
+        }
+    }
+    log.debug("CTS", G, 1, || format!("Found {valid} clusters"));
+    if d.has_hierarchy() {
+        return refuse("clock gate cloning in a hierarchical design (the clone's module) is not modelled");
+    }
+    let mut n_clones = 0;
+    for (n, cluster) in clusters.iter().enumerate() {
+        if cluster.is_empty() {
+            continue;
+        }
+        let (clone, clone_net, disconnect) = if driver_cluster == Some(n) {
+            log.debug("CTS", G, 1, || format!("Original cell {}", icg_term.0));
+            log.debug("CTS", G, 2, || format!(" Original net {icg_net}"));
+            (icg_term.0.clone(), icg_net.clone(), false)
+        } else {
+            n_clones += 1;
+            let net_name = d.make_clock_net(&format!("clonenet_{n_clones}_{icg_net}"))?;
+            f.sta_clock_nets.insert(net_name.clone());
+            let buf_name = format!("clone_{n_clones}_{icg_name}");
+            d.make_clone(&icg_term.0, &buf_name, &net_name)?;
+            log.debug("CTS", G, 1, || format!("Creating clone {buf_name} from {icg_name}"));
+            log.debug("CTS", G, 2, || format!(" New clone net {net_name}"));
+            (buf_name, net_name, true)
+        };
+        let mut bb = BBox::new();
+        for &b in cluster {
+            for t in pins_at(point2pin, b) {
+                if !d.iterm_is_input_signal(&t, true) {
+                    continue;
+                }
+                log.debug("CTS", G, 2, || format!("  Connects sink {}/{}", t.0, t.1));
+                bb.merge(d.iterm_avg_xy(&t).expect("a load with shapes"));
+                if disconnect {
+                    d.reconnect(&t, &clone_net)?;
+                }
+            }
+        }
+        // resolveLocationCollision: one DBU right until the spot is free.
+        let mut loc = bb.center();
+        while occupied.contains(&loc) {
+            loc.0 += 1;
+        }
+        occupied.insert(loc);
+        d.place(&clone, loc)?;
+    }
+    log.debug("CTS", G, 1, || format!("Created {n_clones} clones"));
+    Ok(())
 }
 
 /// `initOneClockTree(driverNet, clkInputNet, sdcClockName, parent)`.

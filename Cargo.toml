@@ -9,14 +9,18 @@ homepage = "https://vyges.com"
 
 [features]
 # The command-line engine: the database, the wire RC, the SDC reader, and JSON jobs.
-cli = ["dep:vyges-opendb", "dep:vyges-est", "dep:vyges-loom", "dep:serde_json"]
+cli = ["dep:vyges-opendb", "dep:vyges-est", "dep:vyges-loom", "dep:vyges-rsz", "dep:serde_json"]
 
 [dependencies]
 # The timer's library model: cells, ports, arcs.
 vyges-sta = { git = "https://github.com/vyges-tools/sta.git", branch = "main" }
+# The Steiner trees clock-gate cloning reads.
+vyges-stt = { git = "https://github.com/vyges-tools/stt.git", branch = "main" }
 vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "main", optional = true }
 vyges-est = { git = "https://github.com/vyges-tools/est.git", branch = "main", features = ["odb"], optional = true }
 vyges-loom = { git = "https://github.com/vyges-tools/loom.git", branch = "main", optional = true }
+# The resizer's buffers and max wire length (cloning's threshold).
+vyges-rsz = { git = "https://github.com/vyges-tools/rsz.git", branch = "main", optional = true }
 serde_json = { version = "1", optional = true }
 
 [lib]
@@ -40,6 +44,15 @@ vyges-sta = { path = "../vyges-tools-sta" }
 
 [patch."https://github.com/vyges-tools/est.git"]
 vyges-est = { path = "../vyges-tools-est" }
+
+[patch."https://github.com/vyges-tools/stt.git"]
+vyges-stt = { path = "../vyges-tools-stt" }
+
+[patch."https://github.com/vyges-tools/rsz.git"]
+vyges-rsz = { path = "../vyges-tools-rsz" }
+
+[patch."https://github.com/vyges-tools/grt.git"]
+vyges-grt = { path = "../vyges-tools-grt" }
 
 [patch."https://github.com/vyges-tools/loom.git"]
 vyges-loom = { path = "../vyges-tools-loom" }

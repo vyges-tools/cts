@@ -33,6 +33,10 @@ pub struct Options {
     /// rsz's `clock_buffer_string_` / `clock_buffer_footprint_` (`set_cts_config`).
     pub clock_buffer_string: Option<String>,
     pub clock_buffer_footprint: Option<String>,
+    /// `maxWl_` (DBU): set from the resizer's max wire length when positive; 0 otherwise. Kept as
+    /// the result of computing it: only clock-gate cloning (and later slices) reads it, so a
+    /// refusal in its computation stops only a run that needs the value.
+    pub max_wl: Result<i32, crate::log::Stop>,
     /// Every other key and flag as last given, for the stages that read them.
     pub other: BTreeMap<String, String>,
 }
@@ -53,6 +57,7 @@ impl Default for Options {
             insertion_delay: true,
             clock_buffer_string: None,
             clock_buffer_footprint: None,
+            max_wl: Ok(0),
             other: BTreeMap::new(),
         }
     }
@@ -206,14 +211,80 @@ pub fn set_cts_config(o: &mut Options, log: &mut Log, m: &dyn Masters, args: &[S
         if s.contains(['*', '?', '[', '\\']) {
             return crate::log::refuse(format!("set_cts_config -skip_nets {s}: patterns are not modelled"));
         }
-        o.skip_nets.extend(words(s));
+        o.skip_nets.extend(tcl_list(s));
     }
     other(o, "-tree_buf");
     other(o, "-wire_unit");
     Ok(())
 }
 
+/// A Tcl list's elements: whitespace-separated words, a `{…}` or `"…"` element taken whole without
+/// its delimiters (what `get_nets $list` iterates).
+pub fn tcl_list(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = s.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        let mut w = String::new();
+        match c {
+            '{' => {
+                chars.next();
+                let mut depth = 1;
+                for ch in chars.by_ref() {
+                    match ch {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    w.push(ch);
+                }
+            }
+            '"' => {
+                chars.next();
+                for ch in chars.by_ref() {
+                    if ch == '"' {
+                        break;
+                    }
+                    w.push(ch);
+                }
+            }
+            _ => {
+                while let Some(&ch) = chars.peek() {
+                    if ch.is_whitespace() {
+                        break;
+                    }
+                    w.push(ch);
+                    chars.next();
+                }
+            }
+        }
+        out.push(w);
+    }
+    out
+}
+
 /// A Tcl number as `expr` compares it.
 pub fn num(s: &str) -> Res<f64> {
     s.trim().parse::<f64>().or_else(|_| crate::log::refuse(format!("{s}: not a number")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Rule (Tcl lists, as `get_nets $keys(-skip_nets)` reads them): quoted and braced elements
+    // lose their delimiters.
+    #[test]
+    fn tcl_lists_unquote() {
+        assert_eq!(tcl_list(r#""gclk1" "gclk3""#), ["gclk1", "gclk3"]);
+        assert_eq!(tcl_list("{a b} c"), ["a b", "c"]);
+    }
 }

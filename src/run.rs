@@ -27,6 +27,9 @@ pub trait Design: ClockDesign + BufferLibs {
     fn find_net(&self, name: &str) -> Option<String>;
     /// The SDC clocks, in the SDC's order.
     fn sdc_clocks(&self) -> Vec<SdcClock>;
+    /// `Resizer::findMaxWireLength(false)` in meters: the least over the scenes with a signal wire
+    /// resistance and the resizer's buffers; `-inf` when no scene has one.
+    fn find_max_wire_length(&self) -> Res<f64>;
 }
 
 struct M<'a>(&'a dyn Design);
@@ -136,9 +139,10 @@ pub fn run_triton_cts(o: &mut Options, log: &mut Log, d: &mut dyn Design) -> Res
     find_clock_roots(o, log);
     let found = populate_triton_cts(o, log, d, &root)?;
     let _ = sink; // read by the trees (later slices)
-    // The end-of-run reset (`rootBuffers_`, `sinkBuffers_` cleared).
+    // The end-of-run reset (`rootBuffers_`, `sinkBuffers_` cleared, the max wire length 0).
     o.root_buffers.clear();
     o.sink_buffers.clear();
+    o.max_wl = Ok(0);
     if found.builders.is_empty() {
         log.warn("CTS", 82, "No valid clock nets in the design.");
         return Ok(Outcome::NoClockNets);
@@ -159,7 +163,16 @@ fn setup_characterization(o: &mut Options, log: &mut Log, d: &mut dyn Design) ->
     let (core, dbu, cap) = (d.core_size(), d.dbu(), d.wire_signal_cap());
     let root = buffers::select_root_buffer(o, log, d, core, dbu, cap)?;
     let sink = buffers::select_sink_buffer(o, log, d, core, dbu, cap)?;
-    // The buffers' fanout limits and the max wire length set options the trees read (later).
+    // The buffers' fanout limits set options the trees read (later).
+    // The max wire length (DBU, `micronsToDbu` rounds): clock-gate cloning's threshold.
+    o.max_wl = d.find_max_wire_length().map(|m| {
+        let microns = m * 1e6;
+        if microns > 0.0 {
+            (microns * f64::from(d.dbu())).round() as i32
+        } else {
+            0
+        }
+    });
     init_characterization(o, log, d, &root, &sink)?;
     Ok((root, sink))
 }
@@ -195,7 +208,7 @@ fn find_clock_roots(o: &Options, log: &mut Log) {
 
 /// `populateTritonCTS`.
 fn populate_triton_cts(o: &Options, log: &mut Log, d: &mut dyn Design, root: &str) -> Res<Found> {
-    let setup = Setup { clock_nets: &o.clock_nets, skip_nets: &o.skip_nets, insertion_delay: o.insertion_delay, buffer_list: &o.buffer_list, root_buffer: root };
+    let setup = Setup { clock_nets: &o.clock_nets, skip_nets: &o.skip_nets, insertion_delay: o.insertion_delay, buffer_list: &o.buffer_list, root_buffer: root, max_wl: o.max_wl.clone() };
     let clocks = d.sdc_clocks();
     discovery::populate_triton_cts(d, log, &setup, &clocks)
 }
