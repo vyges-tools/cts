@@ -37,8 +37,9 @@ fn rsz_masters(db: &Db) -> Res<std::collections::BTreeMap<String, vyges_rsz::pre
                 implant_obs.push(lname.clone());
             }
         }
-        let area = i64::from(db.master_get_width(&name)) * i64::from(db.master_get_height(&name));
-        out.insert(name.clone(), vyges_rsz::preamble::Master { site: db.master_get_site(&name), area, is_core: db.master_is_core(&name), logic_std: db.master_get_type(&name).map_err(e)? == "CORE", implant_obs });
+        let (width, height) = (db.master_get_width(&name), db.master_get_height(&name));
+        let area = i64::from(width) * i64::from(height);
+        out.insert(name.clone(), vyges_rsz::preamble::Master { site: db.master_get_site(&name), area, width, height, is_core: db.master_is_core(&name), logic_std: db.master_get_type(&name).map_err(e)? == "CORE", implant_obs });
     }
     Ok(out)
 }
@@ -303,13 +304,14 @@ impl Design for CliDesign {
         if self.clock_buffer_pattern {
             return vyges_cts::log::refuse("findBuffers with a clock buffer string or footprint is not modelled");
         }
-        let libs = vyges_rsz::preamble::Libs { libs: self.libs.clone(), scenes: Vec::new(), scene_libs: Vec::new() };
+        let libs = vyges_rsz::preamble::Libs { libs: self.libs.clone(), scenes: Vec::new(), scene_libs: Vec::new(), link_scene: None };
         let masters = rsz_masters(&self.db)?;
         let mut dont_use = self.set_dont_use.clone();
         for lib in &self.libs {
             dont_use.extend(lib.cells.values().filter(|c| c.dont_use).map(|c| c.name.clone()));
         }
-        let buffers = vyges_rsz::preamble::find_buffers(&libs, &masters, &dont_use).map_err(|e| Stop::Refused(format!("findBuffers: {}", e.message())))?;
+        // Clock buffers excluded: the resizer's default, which only its hold repair turns off.
+        let buffers = vyges_rsz::preamble::find_buffers(&libs, &masters, &dont_use, true).map_err(|e| Stop::Refused(format!("findBuffers: {}", e.message())))?;
         let (tgt_slews, _, _) = vyges_rsz::preamble::find_target_loads(&libs, &buffers.cells, &dont_use);
         let mut master_pins = HashMap::new();
         for m in &self.masters {
