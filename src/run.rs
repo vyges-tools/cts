@@ -185,6 +185,8 @@ fn init_characterization(o: &Options, log: &mut Log, d: &dyn Design, root: &str,
     }
     buffers::finalize_root_sink_buffers(o, log, root, sink);
     let list = buffers::trim_sort_buffer_list(o, log, d, root, sink, o.buffer_list.clone())?;
+    // "Runs after the buffer list sanity checks in trimSortBufferList".
+    let _delay_buffers = buffers::create_delay_buf_list(o, log, d)?;
     buffers::characterization_buffer(log, d, &list)
 }
 

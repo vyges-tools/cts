@@ -237,6 +237,102 @@ pub fn finalize_root_sink_buffers(o: &Options, log: &mut Log, root: &str, sink: 
     }
 }
 
+/// `TechChar::getDrvrResistance`: the buffer's output `driveResistance()`, 0 without a master,
+/// liberty cell or output port.
+fn drvr_resistance(libs: &dyn BufferLibs, buf: &str) -> f32 {
+    if !libs.has_master(buf) {
+        return 0.0;
+    }
+    libs.liberty_cell(buf).and_then(|c| c.buffer_ports().map(|(_, out)| c.drive_resistance(&out.name))).unwrap_or(0.0)
+}
+
+/// `TechChar::getinternalDelay`: the buffer's output `intrinsicDelay()`, 0 likewise.
+fn internal_delay(libs: &dyn BufferLibs, buf: &str) -> f32 {
+    if !libs.has_master(buf) {
+        return 0.0;
+    }
+    libs.liberty_cell(buf).and_then(|c| c.buffer_ports().map(|(_, out)| c.intrinsic_delay(&out.name))).unwrap_or(0.0)
+}
+
+/// `TechChar::createDelayBufList` (upstream, delay-buffer series ending `55fb63162f`): the buffers
+/// latency balancing may insert, printed under `insertion delay` debug.
+///
+/// Rules, in the reference's order:
+/// - the PROPER delay buffers, only for an inferred list: every library (or the `-library` one),
+///   its buffers in order, clock-cell candidates only; those whose FOOTPRINT contains `clkdly`,
+///   else those whose NAME contains `CLKDLY` or `CLKDEL` (case-insensitive);
+/// - the given buffer list (untrimmed) sorted by drive resistance ascending, then walked: the
+///   first is kept; a buffer whose resistance is more than 10% above the last kept one's
+///   (`(r − prev) / r > 0.1`, a resistance of 0 never) is appended; otherwise one with a HIGHER
+///   intrinsic delay replaces the last kept one;
+/// - the proper delay buffers appended, each once.
+pub fn create_delay_buf_list(o: &Options, log: &mut Log, libs: &dyn BufferLibs) -> Res<Vec<String>> {
+    let mut proper: Vec<String> = Vec::new();
+    if o.buffer_list_inferred {
+        let (mut by_footprint, mut by_name) = (Vec::new(), Vec::new());
+        for lib in libs.libraries() {
+            if o.cts_library.as_ref().is_some_and(|n| *n != lib.name) {
+                continue;
+            }
+            for c in library_buffers(lib) {
+                if !is_clock_cell_candidate(c, libs) {
+                    continue;
+                }
+                if c.footprint.contains("clkdly") {
+                    by_footprint.push(c.name.clone());
+                }
+                if contains_ignore_case(&c.name, "CLKDLY") || contains_ignore_case(&c.name, "CLKDEL") {
+                    by_name.push(c.name.clone());
+                }
+            }
+        }
+        if !by_footprint.is_empty() {
+            proper = by_footprint;
+            log.debug("CTS", "insertion delay", 1, || "Using footprint for clkdly".to_string());
+        } else if !by_name.is_empty() {
+            proper = by_name;
+            log.debug("CTS", "insertion delay", 1, || "Using name for clkdly".to_string());
+        }
+    }
+    let mut by_res = o.buffer_list.clone();
+    // `std::ranges::sort` is not stable; below 17 elements it is an insertion sort, which is.
+    if by_res.len() > 16 {
+        let mut r: Vec<f32> = by_res.iter().map(|b| drvr_resistance(libs, b)).collect();
+        r.sort_by(f32::total_cmp);
+        if r.windows(2).any(|w| w[0] == w[1]) {
+            return crate::log::refuse("more than 16 clock buffers with equal drive resistances: the introsort's tie order is not modelled");
+        }
+    }
+    by_res.sort_by(|a, b| drvr_resistance(libs, a).total_cmp(&drvr_resistance(libs, b)));
+    let mut delay_buffers: Vec<String> = Vec::new();
+    let (mut prev_res, mut prev_delay) = (-1.0f32, -1.0f32);
+    for b in &by_res {
+        let (res, delay) = (drvr_resistance(libs, b), internal_delay(libs, b));
+        if prev_res == -1.0 {
+            delay_buffers.push(b.clone());
+            (prev_res, prev_delay) = (res, delay);
+        } else if res != 0.0 && f64::from((res - prev_res) / res) > 0.1 {
+            delay_buffers.push(b.clone());
+            (prev_res, prev_delay) = (res, delay);
+        } else if delay > prev_delay {
+            delay_buffers.pop();
+            delay_buffers.push(b.clone());
+            (prev_res, prev_delay) = (res, delay);
+        }
+    }
+    for b in proper {
+        if !delay_buffers.contains(&b) {
+            delay_buffers.push(b);
+        }
+    }
+    log.debug("CTS", "insertion delay", 1, || "Delay buffer list = [".to_string());
+    for b in &delay_buffers {
+        log.debug("CTS", "insertion delay", 1, || format!("  {b}"));
+    }
+    log.debug("CTS", "insertion delay", 1, || "]".to_string());
+    Ok(delay_buffers)
+}
+
 /// `TechChar::getMaxCapLimit`: the buffer's output max cap, 0 when unset.
 fn max_cap_limit(libs: &dyn BufferLibs, buf: &str) -> f32 {
     libs.liberty_cell(buf).and_then(buffer_max_cap).unwrap_or(0.0)
@@ -447,5 +543,43 @@ mod tests {
         let mut log = Log::default();
         assert_eq!(characterization_buffer(&mut log, &l, &["A".into(), "B".into()]).unwrap().0, "B");
         assert_eq!(characterization_buffer(&mut log, &l, &["N".into()]).unwrap_err(), crate::log::Stop::Error { tool: "CTS", id: 111 });
+    }
+
+    /// Buffers named by (name, drive resistance in ns/pF, intrinsic delay in ns, footprint).
+    fn timed(cells: &[(&str, f32, f32, &str)]) -> Library {
+        let mut t = String::from("library (l) { time_unit : \"1ns\"; capacitive_load_unit (1, pf);
+            lu_table_template (t) { variable_1 : input_net_transition ; variable_2 : total_output_net_capacitance ;
+              index_1 (\"0, 1\") ; index_2 (\"0, 1\") ; }\n");
+        for (n, res, delay, fp) in cells {
+            t += &format!(
+                "cell ({n}) {{ area : 1; cell_footprint : \"{fp}\"; pin (A) {{ direction : input; capacitance : 0.001; }}
+                 pin (Z) {{ direction : output; function : \"A\";
+                   timing () {{ related_pin : \"A\"; timing_sense : positive_unate;
+                     cell_rise (t) {{ values (\"{delay}, {delay}\", \"{delay}, {delay}\"); }}
+                     rise_transition (t) {{ values (\"0, {res}\", \"0, {res}\"); }} }} }} }}\n"
+            );
+        }
+        t += "}";
+        Library::read(&parse(&t).unwrap()).unwrap()
+    }
+
+    // Rule (createDelayBufList): sorted by drive resistance; a step of more than 10% appends, a
+    // smaller one is replaced when the newcomer's intrinsic delay is higher (kept otherwise); then
+    // the clkdly-footprint buffers of an inferred list, each once.
+    #[test]
+    fn the_delay_buffer_list_steps_by_drive_resistance_and_prefers_slower_neighbours() {
+        let l = Libs(vec![timed(&[
+            ("B1", 1.00, 0.10, "buf"),
+            ("B2", 1.05, 0.20, "buf"), // within 10% of B1, slower: replaces it
+            ("B3", 1.08, 0.05, "buf"), // within 10% of B2, faster: dropped
+            ("B4", 2.00, 0.10, "buf"), // a step: appended
+            ("D1", 1.00, 0.30, "clkdly"),
+        ])], vec![]);
+        let mut o = Options::default();
+        o.buffer_list = ["B4", "B3", "B1", "B2"].map(String::from).to_vec();
+        let mut log = Log::default();
+        assert_eq!(create_delay_buf_list(&o, &mut log, &l).unwrap(), ["B2", "B4"], "a given list adds no clkdly cells");
+        o.buffer_list_inferred = true;
+        assert_eq!(create_delay_buf_list(&o, &mut log, &l).unwrap(), ["B2", "B4", "D1"]);
     }
 }
