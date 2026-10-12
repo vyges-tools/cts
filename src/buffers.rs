@@ -308,10 +308,8 @@ pub fn create_delay_buf_list(o: &Options, log: &mut Log, libs: &dyn BufferLibs) 
     let (mut prev_res, mut prev_delay) = (-1.0f32, -1.0f32);
     for b in &by_res {
         let (res, delay) = (drvr_resistance(libs, b), internal_delay(libs, b));
-        if prev_res == -1.0 {
-            delay_buffers.push(b.clone());
-            (prev_res, prev_delay) = (res, delay);
-        } else if res != 0.0 && f64::from((res - prev_res) / res) > 0.1 {
+        // The first is kept; so is a step of more than 10% (the reference's two identical arms).
+        if prev_res == -1.0 || (res != 0.0 && f64::from((res - prev_res) / res) > 0.1) {
             delay_buffers.push(b.clone());
             (prev_res, prev_delay) = (res, delay);
         } else if delay > prev_delay {
@@ -575,8 +573,7 @@ mod tests {
             ("B4", 2.00, 0.10, "buf"), // a step: appended
             ("D1", 1.00, 0.30, "clkdly"),
         ])], vec![]);
-        let mut o = Options::default();
-        o.buffer_list = ["B4", "B3", "B1", "B2"].map(String::from).to_vec();
+        let mut o = Options { buffer_list: ["B4", "B3", "B1", "B2"].map(String::from).to_vec(), ..Default::default() };
         let mut log = Log::default();
         assert_eq!(create_delay_buf_list(&o, &mut log, &l).unwrap(), ["B2", "B4"], "a given list adds no clkdly cells");
         o.buffer_list_inferred = true;
