@@ -457,14 +457,14 @@ impl vyges_cts::options::Masters for MastersOf<'_> {
 }
 
 const USAGE: &str = "\
-vyges loom cts — clock tree synthesis of a placed design: the clock buffers chosen, each clock net
-found and its sinks collected (the trees themselves are not built yet)
+vyges physical cts — clock tree synthesis of a placed design: the clock buffers chosen, each clock
+net found and its sinks collected (the trees themselves are not built yet)
 
 USAGE:
-  vyges loom cts clock_tree_synthesis <job.json> [-o FILE]
-  vyges loom cts --describe
-  vyges loom cts --help
-  vyges loom cts --version
+  vyges physical cts clock_tree_synthesis <job.json> [-o FILE]
+  vyges physical cts --describe
+  vyges physical cts --help
+  vyges physical cts --version
 
 JOB FIELDS:
   steps        required — the commands in order, each {\"cmd\": ..., \"args\": [...]}, as a flow

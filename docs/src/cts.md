@@ -1,8 +1,9 @@
 # vyges-cts — clock tree synthesis
 
-> **Part of the Vyges Loom suite.** Install once with `vyges install loom`, then run
-> `vyges loom cts`. It's also a standalone `vyges-cts` binary on your PATH (the integration
-> contract for flow authors).
+> **Physical construction — opt-in, and not part of `vyges install loom`.** Install the group with
+> `vyges install physical` (or just this engine with `vyges install cts`), then run
+> `vyges physical cts`. It is also a standalone `vyges-cts` binary on your PATH, which is what the
+> dispatch calls and what a flow author targets directly.
 
 `vyges-cts` answers: **which clock nets does this placed design have, which sinks hang on each,
 and which buffers will build their trees?** It reads the design database, the libraries, the wire

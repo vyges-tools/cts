@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Release the `vyges-cts` CLI (part of the `vyges install loom` suite).
+# Release the `vyges-cts` CLI (part of the `vyges install physical` suite).
 #
 # Modelled on vyges-tools/opendb's release-opendb.yml, and for the same reason: vyges-cts reads
 # the design database through vyges-opendb, which statically links libodb (a C++ library built

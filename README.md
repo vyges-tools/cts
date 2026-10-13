@@ -6,9 +6,9 @@ reports each step exactly as the command's log reads. Characterization and build
 come next; until then a design with a clock net is refused after discovery, never guessed at.
 
 ```sh
-vyges install loom
-vyges loom cts clock_tree_synthesis job.json
-vyges loom cts --describe
+vyges install physical
+vyges physical cts clock_tree_synthesis job.json
+vyges physical cts --describe
 ```
 
 Documentation: [`docs/src/cts.md`](docs/src/cts.md) (an mdBook; `mdbook build docs`), with the
