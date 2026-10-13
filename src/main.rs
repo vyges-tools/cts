@@ -506,7 +506,7 @@ const DESCRIBE: &str = r#"{
   "openroad_pin": "@OPENROAD_PIN@",
   "name": "cts",
   "summary": "clock tree synthesis of a placed design: clock buffers chosen, clock nets found and their sinks collected",
-  "maturity": "experimental",
+  "maturity": "structured",
   "provenance_limitations": [
     "input_hash covers the argument vector, not the content of the job file or of the design files it names.",
     "status is one of up_to_date, vacuous, refused or error. up_to_date means clock nets were looked for and none was found. A design WITH a clock net is refused after discovery (modelled_through: discovery): the trees are not built yet. The declared assertion passes on up_to_date only. Exit status is 0 for up_to_date, 2 for vacuous and for error, 3 for refused.",
@@ -634,6 +634,19 @@ mod tests {
         let d: Value = serde_json::from_str(&describe()).expect("--describe must be valid JSON");
         assert_eq!(d["name"], "cts");
         assert_eq!(d["openroad_pin"].as_str().map(str::len), Some(40));
+    }
+
+    // ⛔ `maturity` has exactly THREE legal values — discovered, structured, workflow-validated —
+    // and the parser maps anything else to `discovered`, where the verdict is suppressed to
+    // `unknown`. This engine said `experimental`, which threw every verdict away. `structured`:
+    // a versioned operation, a normalized result and a declared assertion; the correlation
+    // harness lives outside the repository, so not `workflow-validated`.
+    #[test]
+    fn the_maturity_is_a_legal_rung() {
+        let d: Value = serde_json::from_str(&describe()).expect("--describe must be valid JSON");
+        let m = d["maturity"].as_str().expect("maturity is a string");
+        assert!(["discovered", "structured", "workflow-validated"].contains(&m), "{m}");
+        assert_eq!(m, "structured");
     }
 
     // Rule (vacuous convention): only a checked nothing-to-do exits 0; a refusal never does.
