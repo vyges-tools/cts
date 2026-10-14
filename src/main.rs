@@ -679,6 +679,9 @@ fn run(job: &Value) -> Result<Value, String> {
                 if let Some(path) = job["write_def"].as_str() {
                     d.db.write_def(path).map_err(|e| format!("write_def {path}: {e}"))?;
                 }
+                if let Some(path) = job["write_db"].as_str() {
+                    d.db.write(path).map_err(|e| format!("write_db {path}: {e}"))?;
+                }
                 let mut v = finish(log, &pre, "done", None);
                 v["clock_nets"] = json!(f.builders.len());
                 return Ok(v);
@@ -723,15 +726,19 @@ USAGE:
 JOB FIELDS:
   steps        required — the commands in order, each {\"cmd\": ..., \"args\": [...]}, as a flow
                script passes them: read_db, read_liberty, set_wire_rc, set_layer_rc,
-               set_dont_use, set_debug_level, read_sdc, set_cts_config, then
-               clock_tree_synthesis [options]
+               set_dont_use, set_debug_level, read_sdc, set_cts_config, set_max_fanout,
+               then clock_tree_synthesis [options]
+  write_def    optional — where to write the design as DEF when the command is done
+  write_db     optional — where to write the design as a database when the command is done
 
 MODELLED:
   the buffer list (given, or inferred from the libraries), the root, sink and characterization
-  buffers, clock-gate cloning, every clock net and its sinks (CTS-0049..0052, CTS-0007..0011,
-  CTS-0008, CTS-0082) — the report's lines are the command's own, in its order.
-  Not yet: characterization, the trees, dummy loads, latency balancing — a design with a clock
-  net is refused after discovery (modelled_through: discovery).
+  buffers, clock-gate cloning, every clock net and its sinks, the characterization, each net's
+  H-tree (sink clustering, simple segments, the obstruction-aware legalizer, macro and register
+  trees), the trees written with their dummy loads and clock NDRs, the per-tree report, and the
+  latency balancing of trees with sub-trees — the report's lines are the command's own, in its
+  order.
+  Not yet: -repair_clock_nets, hierarchical designs, clock buffer strings and footprints.
 
 OPTIONS:
   -o FILE               write the JSON report to FILE instead of stdout
