@@ -709,19 +709,16 @@ impl<'a> HTree<'a> {
         for cluster in &solution {
             if !cluster.is_empty() {
                 let mut members: Vec<InstRef> = Vec::new();
-                let (mut x_sum, mut y_sum) = (0.0f32, 0.0f32);
                 for &pi in cluster {
                     let (px, py) = (f64::from(points[pi as usize].0), f64::from(points[pi as usize].1));
                     let Some(&m) = self.map_location_to_sink.get(&P::new(px, py).key()) else {
                         return log.error("CTS", 79, "Sink not found.");
                     };
-                    // `float += double`: summed in double, rounded back.
-                    x_sum = (f64::from(x_sum) + px) as f32;
-                    y_sum = (f64::from(y_sum) + py) as f32;
                     members.push(m);
                 }
-                let n = cluster.len() as f32;
-                let center = P::new(f64::from(x_sum / n), f64::from(y_sum / n));
+                let member_points: Vec<(f32, f32)> = cluster.iter().map(|&pi| points[pi as usize]).collect();
+                let (cx, cy) = cluster_center(&member_points);
+                let center = P::new(f64::from(cx), f64::from(cy));
                 let at = self.legalize_one_buffer(center, &sink_buffer);
                 self.commit_move_loc(center, at);
                 let base = if second_level { "clkbuf_leaf2_" } else { "clkbuf_leaf_" };
@@ -1634,6 +1631,19 @@ impl SegmentBuilder {
     }
 }
 
+/// A cluster's geometric centre as `preSinkClustering` computes it: each coordinate added to a
+/// FLOAT sum as a double (`float += double`: summed in double, rounded back to float each time),
+/// then divided by the count as a float.
+fn cluster_center(points: &[(f32, f32)]) -> (f32, f32) {
+    let (mut x, mut y) = (0.0f32, 0.0f32);
+    for &(px, py) in points {
+        x = (f64::from(x) + f64::from(px)) as f32;
+        y = (f64::from(y) + f64::from(py)) as f32;
+    }
+    let n = points.len() as f32;
+    (x / n, y / n)
+}
+
 /// `computeBranchSinks`: a branching point's sinks, as floats.
 fn compute_branch_sinks(t: &Level, idx: usize) -> Vec<(f32, f32)> {
     t.sinks[idx].iter().map(|p| (p.x as f32, p.y as f32)).collect()
@@ -1816,6 +1826,14 @@ pub fn create_fake_entries(log: &mut Log, lut: &mut Lut, length: u32, fake_lengt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rule (`preSinkClustering`): the centre is the float sum of the members divided by their
+    /// count as a float (not a running mean).
+    #[test]
+    fn a_cluster_centre_is_the_float_mean() {
+        assert_eq!(cluster_center(&[(1.0, 2.0), (2.0, 4.0)]), (1.5, 3.0));
+        assert_eq!(cluster_center(&[(0.1, 0.0), (0.2, 0.0), (0.3, 0.0)]).0, (0.1f32 + 0.2 + 0.3) / 3.0);
+    }
 
     /// Rule (`operator<<` of a double on a default stream): six significant digits, `%g`.
     #[test]

@@ -232,15 +232,8 @@ fn write_clock_nets_to_db(log: &mut Log, d: &mut dyn TreeDb, w: &mut Writer, tre
                 InstRef::Buffer(b) => first_input(d, &trees[ti].clock.buffers[b].name),
                 InstRef::Sink(k) => Some(sink_term(&trees[ti].clock.sinks[k].name)),
             };
-            // ⛔ Once one sink is missing or unplaced, no later sink of the net is connected.
-            match &pin {
-                None => input_found = false,
-                Some(p) => {
-                    if !d.inst_is_placed(&p.0) {
-                        input_found = false;
-                    }
-                }
-            }
+            let placed = pin.as_ref().map(|p| d.inst_is_placed(&p.0));
+            input_found = still_connecting(input_found, placed);
             if input_found {
                 d.connect(pin.as_ref().expect("found"), &sub.name)?;
             }
@@ -567,16 +560,8 @@ fn insert_dummy_cell(log: &mut Log, d: &mut dyn TreeDb, w: &mut Writer, o: &WOpt
         return Ok(false);
     }
     let delta = ideal - cap;
-    let mut min_diff = f32::MAX;
-    let mut best: Option<&Candidate> = None;
-    for c in candidates {
-        let diff = (c.cap - delta).abs();
-        if diff < min_diff {
-            min_diff = diff;
-            best = Some(c);
-        }
-    }
-    let Some(best) = best else { return refuse("no dummy-load candidate") };
+    let caps: Vec<f32> = candidates.iter().map(|c| c.cap).collect();
+    let Some(best) = find_best_dummy_cell(&caps, delta).map(|i| &candidates[i]) else { return refuse("no dummy-load candidate") };
     log.debug("CTS", "dummy load", 1, || format!("insertDummyCell {} at {}", t.clock.buffers[b].name, best.cell));
     // `placeDummyCell`: the database instance is `clkload<n>`; the tree's copy gets the net suffix.
     let name = format!("clkload{}", w.dummy_load_index);
@@ -594,6 +579,27 @@ fn insert_dummy_cell(log: &mut Log, d: &mut dyn TreeDb, w: &mut Writer, o: &WOpt
     d.connect(&input, &net)?;
     t.clock.subnets[sub].insts.push(InstRef::Buffer(dummy));
     Ok(true)
+}
+
+/// `findBestDummyCell`: the candidate whose input cap is nearest the gap — the FIRST on a tie.
+fn find_best_dummy_cell(caps: &[f32], delta: f32) -> Option<usize> {
+    let mut min_diff = f32::MAX;
+    let mut best = None;
+    for (i, &c) in caps.iter().enumerate() {
+        let diff = (c - delta).abs();
+        if diff < min_diff {
+            min_diff = diff;
+            best = Some(i);
+        }
+    }
+    best
+}
+
+/// A subnet's sinks are connected while every one so far was found and placed. ⛔ The flag is
+/// sticky: once one sink is missing (`None`) or unplaced, no LATER sink of the net is connected
+/// either (the net is then removed).
+fn still_connecting(so_far: bool, placed: Option<bool>) -> bool {
+    so_far && placed == Some(true)
 }
 
 /// What `countSinksPostDbWrite` accumulates.
@@ -840,4 +846,39 @@ fn write_clock_ndrs_to_db(log: &mut Log, d: &mut dyn TreeDb, trees: &[Tree], str
         log.debug("CTS", "ndr", 1, || format!("Non-default rule {r} for double spacing has been applied to {count} clock nets"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Rule (`findBestDummyCell`): the nearest input cap to the gap wins; a tie keeps the first.
+    #[test]
+    fn best_dummy_cell_is_the_first_nearest() {
+        assert_eq!(find_best_dummy_cell(&[1.0, 2.0, 4.0], 2.2), Some(1));
+        assert_eq!(find_best_dummy_cell(&[1.0, 3.0], 2.0), Some(0), "1 and 3 are equally near 2: the first");
+        assert_eq!(find_best_dummy_cell(&[], 2.0), None);
+    }
+
+    /// Rule (`writeClockNetsToDb`): the connecting flag is sticky — after a missing or unplaced
+    /// sink, later placed sinks are not connected.
+    #[test]
+    fn an_unplaced_sink_stops_the_rest_of_the_net() {
+        let mut on = true;
+        let mut connected = Vec::new();
+        for placed in [Some(true), Some(false), Some(true)] {
+            on = still_connecting(on, placed);
+            connected.push(on);
+        }
+        assert_eq!(connected, [true, false, false]);
+        assert!(!still_connecting(true, None));
+    }
+
+    /// Rule (`sta::fuzzyEqual`): equal within 1e-6 relative, zero against 1e-15 absolute.
+    #[test]
+    fn caps_compare_fuzzily() {
+        assert!(sta_fuzzy_equal(1.0e-15, 1.0e-15 * (1.0 + 1e-7)));
+        assert!(!sta_fuzzy_equal(1.0e-15, 1.1e-15));
+        assert!(sta_fuzzy_equal(0.0, 1e-16));
+    }
 }
