@@ -96,8 +96,10 @@ struct CliDesign {
     /// `dbNet` ids by name (the block's net order).
     net_ids: HashMap<String, u32>,
     bterms: HashSet<String>,
-    /// The SDC has `set_max_fanout` (its limits are not modelled).
+    /// The SDC has `set_max_fanout` on something other than the design (not modelled).
     sdc_max_fanout: bool,
+    /// `set_max_fanout V [current_design]` (`Sdc::fanoutLimit(top cell)`).
+    design_max_fanout: Option<f32>,
     /// `set_max_fanout` on a cell (`Sdc::setFanoutLimit(Cell*)`): the last value given.
     cell_max_fanout: HashMap<String, f32>,
     /// The liberty clock data the estimator and the constant propagation read.
@@ -528,16 +530,20 @@ impl Design for CliDesign {
     }
     fn buffer_fanout_limit(&self, buffer: &str) -> Res<i32> {
         if self.sdc_max_fanout {
-            return vyges_cts::log::refuse("set_max_fanout (the SDC fanout limits) is not modelled");
+            return vyges_cts::log::refuse("set_max_fanout on a port or pin (the SDC fanout limits) is not modelled");
         }
         let mut fanout = i32::MAX;
+        // The design's own limit first; without an output port it is the only one read.
+        if let Some(f) = self.design_max_fanout {
+            fanout = fanout.min(f as i32);
+        }
         // The first output terminal that is not a supply.
         let out = self.db.master_get_m_terms(buffer).into_iter().find(|t| {
             let sig = self.db.mterm_get_sig_type(buffer, t);
             sig != "POWER" && sig != "GROUND" && self.db.mterm_get_io_type(buffer, t) == "OUTPUT"
         });
-        // Without an output port only the design's limit (none modelled) is read: 0.
-        let Some(out) = out else { return Ok(0) };
+        // Without an output port only the design's limit is read.
+        let Some(out) = out else { return Ok(self.design_max_fanout.map_or(0, |_| fanout)) };
         if let Some(&f) = self.cell_max_fanout.get(buffer) {
             fanout = fanout.min(f as i32);
         }
@@ -561,7 +567,7 @@ fn read_text(path: &str) -> Result<String, String> {
 }
 
 fn run(job: &Value) -> Result<Value, String> {
-    let mut d = CliDesign { db: Db::new(), libs: Vec::new(), rc: vyges_est::rc::Rc::new(), tech: String::new(), clocks: Vec::new(), dont_use: BTreeSet::new(), set_dont_use: BTreeSet::new(), routing_alpha_set: false, clock_buffer_pattern: false, masters: HashSet::new(), net_ids: HashMap::new(), bterms: HashSet::new(), sdc_max_fanout: false, cell_max_fanout: HashMap::new(), liberty: vyges_est::liberty::LibertyClocks::default(), sdc: None, clock_arrivals: None };
+    let mut d = CliDesign { db: Db::new(), libs: Vec::new(), rc: vyges_est::rc::Rc::new(), tech: String::new(), clocks: Vec::new(), dont_use: BTreeSet::new(), set_dont_use: BTreeSet::new(), routing_alpha_set: false, clock_buffer_pattern: false, masters: HashSet::new(), net_ids: HashMap::new(), bterms: HashSet::new(), sdc_max_fanout: false, design_max_fanout: None, cell_max_fanout: HashMap::new(), liberty: vyges_est::liberty::LibertyClocks::default(), sdc: None, clock_arrivals: None };
     let mut o = Options::default();
     let mut log = Log::default();
     let mut pre: Vec<String> = Vec::new();
@@ -624,7 +630,10 @@ fn run(job: &Value) -> Result<Value, String> {
                             return vyges_cts::log::refuse(format!("{path}: {c} (the clock network it changes) is not modelled"));
                         }
                     }
-                    d.sdc_max_fanout = s.ignored.iter().any(|i| i == "set_max_fanout");
+                    // `set_max_fanout V [current_design]` is the design's limit (read); on any other
+                    // object it is not modelled.
+                    d.sdc_max_fanout = s.max_fanout_on_objects;
+                    d.design_max_fanout = s.max_fanout.map(|v| v as f32);
                     d.clocks = s
                         .clocks
                         .iter()
