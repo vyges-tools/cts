@@ -402,22 +402,7 @@ impl Balancer<'_> {
                 }
             }
         }
-        let (mut best_w, mut best_j, mut best_dist, mut best_len) = (0i64, -1i32, target, 0i32);
-        for w in 1..=max_w {
-            for j in 0..n {
-                let len = dp[st(w, j)];
-                if len == UNSET {
-                    continue;
-                }
-                let dist = (w - target).abs();
-                if dist < best_dist || (dist == best_dist && len < best_len) {
-                    best_w = w;
-                    best_j = j as i32;
-                    best_dist = dist;
-                    best_len = len;
-                }
-            }
-        }
+        let (best_w, best_j) = pick_best_chain(&dp, n, max_w, target);
         if best_j == -1 {
             return (0, Vec::new());
         }
@@ -611,18 +596,82 @@ impl Balancer<'_> {
     }
 }
 
+/// `solveDP`'s pick: over weights from 1 up and buffers in order, the chain nearest the target;
+/// on equal distance the SHORTER chain, and on equal length the first found. The empty chain
+/// (distance = target) is the baseline. `dp[w * n + j]` is a chain length, -1 when unset.
+fn pick_best_chain(dp: &[i32], n: usize, max_w: i64, target: i64) -> (i64, i32) {
+    let (mut best_w, mut best_j, mut best_dist, mut best_len) = (0i64, -1i32, target, 0i32);
+    for w in 1..=max_w {
+        for j in 0..n {
+            let len = dp[w as usize * n + j];
+            if len == -1 {
+                continue;
+            }
+            let dist = (w - target).abs();
+            if dist < best_dist || (dist == best_dist && len < best_len) {
+                best_w = w;
+                best_j = j as i32;
+                best_dist = dist;
+                best_len = len;
+            }
+        }
+    }
+    (best_w, best_j)
+}
+
 /// `propagateClock`: through buffers, inverters and combinational cells; through a sequential
 /// cell only at a clock-gate clock or latch data input.
 fn propagate_clock(d: &dyn TreeDb, input: &ITerm) -> bool {
     let master = d.inst_master(&input.0);
     let Some(cell) = d.liberty_cell(&master) else { return false };
+    propagates_through(cell, &input.1)
+}
+
+/// The cell side of `propagateClock`.
+fn propagates_through(cell: &vyges_sta::liberty::Cell, pin: &str) -> bool {
     if cell.is_inverter() || cell.is_buffer() {
         return true;
     }
     if cell.seqs.is_empty() {
         return true;
     }
-    let Some(port) = cell.ports.iter().find(|p| p.name == input.1) else { return false };
-    let latch_data = cell.seqs.iter().any(|s| !s.is_register && s.data.as_deref().is_some_and(|f| vyges_sta::liberty::identifiers(f).iter().any(|p| p == &input.1)));
+    let Some(port) = cell.ports.iter().find(|p| p.name == pin) else { return false };
+    let latch_data = cell.seqs.iter().any(|s| !s.is_register && s.data.as_deref().is_some_and(|f| vyges_sta::liberty::identifiers(f).iter().any(|p| p == pin)));
     port.is_clock_gate_clock || latch_data
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Rule (`solveDP`): nearest the target wins; a tie in distance goes to the shorter chain; a
+    /// tie in both keeps the first (lower weight, then lower buffer index).
+    #[test]
+    fn the_nearest_then_shortest_chain_is_picked() {
+        // n = 2 buffers, weights 0..=4, target 2: w=1 (j=0, len 1) and w=3 (j=1, len 3) are both
+        // 1 away; the shorter (w=1) wins. w=3 j=0 (len 1) ties w=1 in both: the first stays.
+        let n = 2;
+        let mut dp = vec![-1; 5 * n];
+        dp[n] = 1;
+        dp[3 * n + 1] = 3;
+        dp[3 * n] = 1;
+        assert_eq!(pick_best_chain(&dp, n, 4, 2), (1, 0));
+        // Nothing nearer than the empty chain: none.
+        assert_eq!(pick_best_chain(&vec![-1; 5 * n], n, 4, 2), (0, -1));
+    }
+
+    /// Rule (`propagateClock`): a sequential cell passes the clock only at a clock-gate clock pin
+    /// (or a latch's data input).
+    #[test]
+    fn a_gater_passes_the_clock_at_its_clock_gate_pin_only() {
+        use vyges_sta::liberty::{Cell, Direction, Port, Seq};
+        let port = |name: &str, dir: Direction, gate: bool| Port { name: name.into(), direction: dir, is_clock: false, capacitance: [[0.0; 2]; 2], function: None, max_transition: None, max_capacitance: None, fanout_load: None, max_fanout: None, three_state: None, is_clock_gate_clock: gate };
+        let mut icg = Cell { name: "ICG".into(), ..Cell::default() };
+        icg.ports = vec![port("CLK", Direction::Input, true), port("GATE", Direction::Input, false), port("GCLK", Direction::Output, false)];
+        icg.seqs = vec![Seq { is_register: false, clock: Some("CLK".into()), data: Some("GATE".into()), clear: None, preset: None, clear_preset_var1: Default::default(), clear_preset_var2: Default::default(), output: Some("IQ".into()), output_inv: None }];
+        assert!(propagates_through(&icg, "CLK"));
+        assert!(propagates_through(&icg, "GATE"), "a latch's data input propagates too");
+        icg.ports[0].is_clock_gate_clock = false;
+        assert!(!propagates_through(&icg, "CLK"));
+    }
 }
