@@ -46,6 +46,17 @@ pub trait TreeDb: ClockDesign {
     /// The rule's width and spacing on a layer (its layer rule made when absent).
     fn set_ndr_layer(&mut self, ndr: &str, layer: &str, width: i32, spacing: i32) -> Res<()>;
     fn set_net_ndr(&mut self, net: &str, ndr: &str) -> Res<()>;
+    /// `findMaster`.
+    fn has_master_cell(&self, name: &str) -> bool;
+    /// The clock arrival `getVertexClkArrival` reads at a sink: on the written design, clocks
+    /// propagated and the placement parasitics estimated (timed once, when first asked), the first
+    /// max path of a rising clock edge whose clock path starts on `top_net`; `None` without one.
+    fn sink_clock_arrival(&mut self, t: &ITerm, top_net: &str) -> Res<Option<f32>>;
+    /// The centre of the net's first port's bounding box.
+    fn net_first_bterm_center(&self, net: &str) -> Option<(i32, i32)>;
+    /// `dbNet::insertBufferBeforeLoads` (`IF_NEEDED` names, loads on other nets allowed): the new
+    /// instance's name.
+    fn insert_buffer_before_loads(&mut self, net: &str, loads: &[ITerm], master: &str, loc: (i32, i32), buf_name: &str, net_name: &str) -> Res<String>;
 }
 
 /// `CtsOptions::NdrStrategy`.
@@ -75,6 +86,9 @@ impl Ndr {
 pub struct Tree {
     pub clock: Clock,
     pub net: String,
+    /// The SDC clock and the net the clock enters on (`getTopInputNet`).
+    pub sdc_clock: String,
+    pub top_input_net: String,
     pub tree_type: TreeType,
     pub top_buffer_name: String,
     /// `setDrivingNet` (the register tree's: the macro tree's net).
@@ -374,7 +388,7 @@ pub fn input_pin_cap(d: &dyn TreeDb, t: &ITerm) -> f32 {
 }
 
 /// `sta::fuzzyEqual` for floats.
-fn sta_fuzzy_equal(a: f32, b: f32) -> bool {
+pub(crate) fn sta_fuzzy_equal(a: f32, b: f32) -> bool {
     if a == b {
         return true;
     }

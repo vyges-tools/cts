@@ -163,7 +163,7 @@ pub fn run_triton_cts(o: &mut Options, log: &mut Log, d: &mut dyn Design) -> Res
 
 /// The command's stages, in order.
 fn run_stages(o: &mut Options, log: &mut Log, d: &mut dyn Design) -> Res<Outcome> {
-    let (root, sink, mut lut, char_setup, max_fanout) = setup_characterization(o, log, d)?;
+    let (root, sink, mut lut, char_setup, max_fanout, delay_buffers) = setup_characterization(o, log, d)?;
     find_clock_roots(o, log);
     let found = populate_triton_cts(o, log, d, &root)?;
     if found.builders.is_empty() {
@@ -173,7 +173,7 @@ fn run_stages(o: &mut Options, log: &mut Log, d: &mut dyn Design) -> Res<Outcome
     check_characterization(log, d, &lut)?;
     let ho = tree_options(o, d, &root, &sink, char_setup, max_fanout)?;
     let mut ho = ho;
-    let mut trees = build_clock_trees(log, d, &mut ho, &mut lut, &found)?;
+    let (mut trees, legalizers) = build_clock_trees(log, d, &mut ho, &mut lut, &found)?;
     // `-apply_ndr` (default half); a value the command's type check rejects is refused.
     let ndr = match o.other.get("-apply_ndr") {
         None => crate::write::Ndr::Half,
@@ -182,14 +182,14 @@ fn run_stages(o: &mut Options, log: &mut Log, d: &mut dyn Design) -> Res<Outcome
     let wo = crate::write::WOptions { dummy_load: o.other.get("dummy_load").is_none_or(|v| v == "true"), max_fanout: ho.max_fanout, buffer_list: o.buffer_list.clone(), db_units: d.dbu(), ndr };
     let mut w = crate::write::Writer::default();
     crate::write::write_data_to_db(log, d, &mut w, &wo, &mut trees)?;
-    // `setAllClocksPropagated` prints nothing; the clock-net repair and the latency balancing that
-    // follow are later slices.
+    // `setAllClocksPropagated` prints nothing: the timer the balancer asks is built on the written
+    // design with every non-virtual clock propagated and the placement parasitics re-estimated.
     if o.other.get("repair_clock_nets").is_some_and(|v| v == "true") {
         return refuse("-repair_clock_nets is not modelled");
     }
-    if o.insertion_delay && trees.iter().any(|t| t.parent.is_none() && t.has_children) {
-        return refuse("latency balancing (a tree with sub-trees) is not modelled");
-    }
+    let unit = f64::from(d.dbu());
+    let bo = crate::latency::BOptions { delay_buffers: &delay_buffers, cap_per_dbu: d.wire_clk_cap() * 1e-6 / unit, res_per_dbu: d.wire_clk_res() * 1e-6 / unit, wire_segment_unit: lut.length_unit as i32 };
+    crate::latency::balance_macro_register_latencies(log, d, &bo, &trees, &legalizers, o.insertion_delay)?;
     Ok(Outcome::Done(found))
 }
 
@@ -290,7 +290,8 @@ fn iterm_position(d: &dyn Design, inst: &str, pin: &str) -> (i32, i32) {
 }
 
 /// `buildClockTrees`: each builder's blockages, then its tree.
-fn build_clock_trees(log: &mut Log, d: &dyn Design, ho: &mut crate::htree::HOptions, lut: &mut crate::techchar::Lut, found: &Found) -> Res<Vec<crate::write::Tree>> {
+#[allow(clippy::type_complexity)]
+fn build_clock_trees(log: &mut Log, d: &dyn Design, ho: &mut crate::htree::HOptions, lut: &mut crate::techchar::Lut, found: &Found) -> Res<(Vec<crate::write::Tree>, Vec<crate::htree::Legalizer>)> {
     use crate::htree::{Clock, ClockInst, HDesign, HTree, TreeType};
     let mut master_size = std::collections::HashMap::new();
     for s in &lut.segments {
@@ -306,6 +307,7 @@ fn build_clock_trees(log: &mut Log, d: &dyn Design, ho: &mut crate::htree::HOpti
         }
     }
     let mut out = Vec::new();
+    let mut legalizers = Vec::new();
     for b in &found.builders {
         let tree_type = match b.tree_type {
             Some("MacroTree") => TreeType::Macro,
@@ -348,7 +350,10 @@ fn build_clock_trees(log: &mut Log, d: &dyn Design, ho: &mut crate::htree::HOpti
         t.probe_tree(log);
         let driving_net = (tree_type == TreeType::Register).then(|| b.parent.map(|p| found.builders[p].net.clone())).flatten();
         let index = out.len();
+        legalizers.push(t.legalizer());
         out.push(crate::write::Tree {
+            sdc_clock: b.sdc_clock.clone(),
+            top_input_net: b.input_net.clone(),
             net: b.net.clone(),
             tree_type,
             top_buffer_name: t.top_buffer_name.clone(),
@@ -362,14 +367,14 @@ fn build_clock_trees(log: &mut Log, d: &dyn Design, ho: &mut crate::htree::HOpti
             clock: t.clock,
         });
     }
-    Ok(out)
+    Ok((out, legalizers))
 }
 
 /// `setupCharacterization`: the library check, the root and sink buffers, then the
 /// characterization's opening (`TechChar::create` → `initCharacterization` up to the
 /// characterization buffer). Returns the root and sink buffers.
 #[allow(clippy::type_complexity)]
-fn setup_characterization(o: &mut Options, log: &mut Log, d: &mut dyn Design) -> Res<(String, String, crate::techchar::Lut, (u32, f64, f64), (i32, i32))> {
+fn setup_characterization(o: &mut Options, log: &mut Log, d: &mut dyn Design) -> Res<(String, String, crate::techchar::Lut, (u32, f64, f64), (i32, i32), Vec<String>)> {
     if let Some(l) = &o.cts_library {
         if !d.has_library(l) {
             return log.error("CTS", 209, format!("Library {l} cannot be found because it is not loaded or name is incorrect"));
@@ -391,13 +396,14 @@ fn setup_characterization(o: &mut Options, log: &mut Log, d: &mut dyn Design) ->
             0
         }
     });
-    let (lut, unit) = init_characterization(o, log, d, &root, &sink)?;
-    Ok((root, sink, lut, unit, (root_max_fanout, sink_max_fanout)))
+    let (lut, unit, delay_buffers) = init_characterization(o, log, d, &root, &sink)?;
+    Ok((root, sink, lut, unit, (root_max_fanout, sink_max_fanout), delay_buffers))
 }
 
 /// `TechChar::initCharacterization`, to the characterization buffer.
 /// Returns the table and (the characterization unit, capacitance per DBU, sink buffer input cap).
-fn init_characterization(o: &Options, log: &mut Log, d: &dyn Design, root: &str, sink: &str) -> Res<(crate::techchar::Lut, (u32, f64, f64))> {
+#[allow(clippy::type_complexity)]
+fn init_characterization(o: &Options, log: &mut Log, d: &dyn Design, root: &str, sink: &str) -> Res<(crate::techchar::Lut, (u32, f64, f64), Vec<String>)> {
     init_clock_layer_res_cap(log, d);
     if o.buffer_list.is_empty() {
         return log.error("CTS", 73, "Buffer not found. Check your -buf_list input.");
@@ -405,7 +411,7 @@ fn init_characterization(o: &Options, log: &mut Log, d: &dyn Design, root: &str,
     buffers::finalize_root_sink_buffers(o, log, root, sink);
     let list = buffers::trim_sort_buffer_list(o, log, d, root, sink, o.buffer_list.clone())?;
     // "Runs after the buffer list sanity checks in trimSortBufferList".
-    let _delay_buffers = buffers::create_delay_buf_list(o, log, d)?;
+    let delay_buffers = buffers::create_delay_buf_list(o, log, d)?;
     let (char_buf, slews, loads) = buffers::characterization_buffer(log, d, &list)?;
     // The rest of `initCharacterization`, then the patterns and the table (`TechChar::create`).
     let wire_unit = match o.other.get("-wire_unit") {
@@ -425,7 +431,7 @@ fn init_characterization(o: &Options, log: &mut Log, d: &dyn Design, root: &str,
     log.trace(probe);
     let (lut, _) = crate::techchar::create(log, d, &setup)?;
     crate::techchar::probe_segments(log, &lut);
-    Ok((lut, (setup.unit, setup.cap_per_dbu, setup.sink_buffer_input_cap)))
+    Ok((lut, (setup.unit, setup.cap_per_dbu, setup.sink_buffer_input_cap), delay_buffers))
 }
 
 /// `TechChar::initClockLayerResCap`: CTS-0104 when the clock wire's resistance or capacitance per

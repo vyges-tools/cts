@@ -14,6 +14,7 @@ pub mod buffers;
 pub mod clustering;
 pub mod discovery;
 pub mod htree;
+pub mod latency;
 pub mod lemon;
 pub mod log;
 pub mod options;

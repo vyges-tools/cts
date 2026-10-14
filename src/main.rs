@@ -100,6 +100,13 @@ struct CliDesign {
     sdc_max_fanout: bool,
     /// `set_max_fanout` on a cell (`Sdc::setFanoutLimit(Cell*)`): the last value given.
     cell_max_fanout: HashMap<String, f32>,
+    /// The liberty clock data the estimator and the constant propagation read.
+    liberty: vyges_est::liberty::LibertyClocks,
+    /// The constraints as read.
+    sdc: Option<vyges_loom::sdc::Sdc>,
+    /// The clock arrivals on the written design (timed when first asked): per pin, each max path of
+    /// a rising clock edge in the search's order, with the net its clock path starts on.
+    clock_arrivals: Option<HashMap<String, Vec<(f32, String)>>>,
 }
 
 impl CliDesign {
@@ -365,6 +372,84 @@ impl vyges_cts::write::TreeDb for CliDesign {
     fn set_net_ndr(&mut self, net: &str, ndr: &str) -> Res<()> {
         self.db.net_set_non_default_rule(net, ndr).map_err(|e| Stop::Refused(format!("{net} NDR {ndr}: {e}")))
     }
+    fn has_master_cell(&self, name: &str) -> bool {
+        self.masters.contains(name)
+    }
+    fn sink_clock_arrival(&mut self, t: &ITerm, top_net: &str) -> Res<Option<f32>> {
+        if self.clock_arrivals.is_none() {
+            let table = self.clock_arrival_table().map_err(Stop::Refused)?;
+            self.clock_arrivals = Some(table);
+        }
+        let pin = format!("{}/{}", t.0, t.1);
+        Ok(self.clock_arrivals.as_ref().expect("timed").get(&pin).and_then(|v| v.iter().find(|(_, net)| net == top_net).map(|(a, _)| *a)))
+    }
+    fn net_first_bterm_center(&self, net: &str) -> Option<(i32, i32)> {
+        let b = self.db.net_get_b_terms(net).into_iter().next()?;
+        Some(((self.db.bterm_get_b_box_x_min(&b) + self.db.bterm_get_b_box_x_max(&b)) / 2, (self.db.bterm_get_b_box_y_min(&b) + self.db.bterm_get_b_box_y_max(&b)) / 2))
+    }
+    fn insert_buffer_before_loads(&mut self, net: &str, loads: &[ITerm], master: &str, loc: (i32, i32), buf_name: &str, net_name: &str) -> Res<String> {
+        let name = self.db.insert_buffer_before_loads(Some(net), loads, &[], master, Some(loc), buf_name, Some(net_name), "IF_NEEDED", true).map_err(|e| Stop::Refused(format!("insertBufferBeforeLoads {buf_name}: {e}")))?;
+        self.refresh();
+        Ok(name)
+    }
+}
+
+impl CliDesign {
+    /// `setAllClocksPropagated` then the latency balancer's `initSta`: the written design timed
+    /// with every non-virtual clock propagated, on placement parasitics estimated now; per pin,
+    /// each max path of a rising clock edge (in the search's order) and the net its clock path
+    /// starts on.
+    fn clock_arrival_table(&mut self) -> Result<HashMap<String, Vec<(f32, String)>>, String> {
+        use vyges_rsz::env::{master_pins, placement_parasitics_at, port_caps_at, sdc_env, search_sdc, sim_constants};
+        if self.routing_alpha_set {
+            return Err("set_routing_alpha before the latency balancer's parasitics: not modelled".into());
+        }
+        let libs = vyges_rsz::preamble::Libs { libs: self.libs.clone(), scenes: Vec::new(), scene_libs: Vec::new(), link_scene: None };
+        let netlist = vyges_grt::timer::netlist(&self.db);
+        let mut s = self.sdc.take().ok_or("the latency balancer without constraints: not modelled")?;
+        // Every non-virtual clock propagated, whatever set_propagated_clock named.
+        let named = std::mem::take(&mut s.propagated);
+        let r = (|| -> Result<HashMap<String, Vec<(f32, String)>>, String> {
+            let clock_sources: Vec<String> = s.clocks.iter().filter(|c| !c.is_virtual()).flat_map(|c| c.sources.iter().cloned()).collect();
+            let mut rc = self.rc.clone();
+            rc.sort_clk_and_signal_layers();
+            let caps = port_caps_at(None, Some(&s), &libs, &netlist)?;
+            let par = placement_parasitics_at(&self.db, &rc, &self.liberty, &clock_sources, true, 0.3, 1, &caps)?;
+            let mut env = sdc_env(&s, &libs, &netlist)?;
+            env.constants = sim_constants(&self.db, &self.liberty)?;
+            let mpins = master_pins(&self.db)?;
+            let mut g = vyges_rsz::repair_design::timer_graph(&libs, 0, &netlist, &env, &mpins).map_err(|e| e.message().to_string())?;
+            g.find_delays(&par[0], None)?;
+            let time_scale = libs.default_library().ok_or("no liberty library")?.time_scale;
+            let ssdc = search_sdc(&s, time_scale, true, false)?;
+            let mut search = vyges_sta::search::Search::in_graph_order(&g, &ssdc);
+            search.find_arrivals()?;
+            let mut out: HashMap<String, Vec<(f32, String)>> = HashMap::new();
+            for (v, vx) in g.vertices.iter().enumerate() {
+                for p in &search.paths[v] {
+                    let (Some(edge), 1) = (p.tag.clk_edge, p.tag.mm) else { continue };
+                    if edge % 2 != 0 {
+                        continue;
+                    }
+                    // The clock path's start (`PathExpanded::startPath`) and its net.
+                    let (mut sv, mut sp) = (v, p);
+                    while let Some((pv, pp)) = search.prev_path(sp) {
+                        (sv, sp) = (pv, pp);
+                    }
+                    let start = &g.vertices[sv].name;
+                    let net = match start.rsplit_once('/') {
+                        Some((i, pin)) => self.db.iterm_get_net(i, pin),
+                        None => self.db.bterm_get_net(start),
+                    };
+                    out.entry(vx.name.clone()).or_default().push((p.arrival, net));
+                }
+            }
+            Ok(out)
+        })();
+        s.propagated = named;
+        self.sdc = Some(s);
+        r
+    }
 }
 
 impl vyges_cts::techchar::CharDesign for CliDesign {
@@ -476,8 +561,7 @@ fn read_text(path: &str) -> Result<String, String> {
 }
 
 fn run(job: &Value) -> Result<Value, String> {
-    let mut d = CliDesign { db: Db::new(), libs: Vec::new(), rc: vyges_est::rc::Rc::new(), tech: String::new(), clocks: Vec::new(), dont_use: BTreeSet::new(), set_dont_use: BTreeSet::new(), routing_alpha_set: false, clock_buffer_pattern: false, masters: HashSet::new(), net_ids: HashMap::new(), bterms: HashSet::new(), sdc_max_fanout: false, cell_max_fanout: HashMap::new() };
-    let mut liberty = vyges_est::liberty::LibertyClocks::default();
+    let mut d = CliDesign { db: Db::new(), libs: Vec::new(), rc: vyges_est::rc::Rc::new(), tech: String::new(), clocks: Vec::new(), dont_use: BTreeSet::new(), set_dont_use: BTreeSet::new(), routing_alpha_set: false, clock_buffer_pattern: false, masters: HashSet::new(), net_ids: HashMap::new(), bterms: HashSet::new(), sdc_max_fanout: false, cell_max_fanout: HashMap::new(), liberty: vyges_est::liberty::LibertyClocks::default(), sdc: None, clock_arrivals: None };
     let mut o = Options::default();
     let mut log = Log::default();
     let mut pre: Vec<String> = Vec::new();
@@ -503,16 +587,16 @@ fn run(job: &Value) -> Result<Value, String> {
                     }
                     let path = args.last().ok_or_else(|| Stop::Refused("read_liberty path".into()))?;
                     let text = read_text(path).map_err(Stop::Refused)?;
-                    liberty.read(&text).map_err(|e| Stop::Refused(format!("{path}: {e}")))?;
+                    d.liberty.read(&text).map_err(|e| Stop::Refused(format!("{path}: {e}")))?;
                     let group = vyges_sta::liberty_parse::parse(&text).map_err(|e| Stop::Refused(format!("{path}: {e}")))?;
                     d.libs.push(Library::read(&group).map_err(|e| Stop::Refused(format!("{path}: {e} (not modelled)")))?);
                 }
                 "define_corners" => return vyges_cts::log::refuse("define_corners: several scenes are not modelled"),
                 "set_wire_rc" => {
                     d.rc.check_set_wire_rc(&d.db, &args).map_err(Stop::Refused)?;
-                    d.rc.set_wire_rc(&d.db, units(&liberty).map_err(Stop::Refused)?, &args).map_err(Stop::Refused)?;
+                    d.rc.set_wire_rc(&d.db, units(&d.liberty).map_err(Stop::Refused)?, &args).map_err(Stop::Refused)?;
                 }
-                "set_layer_rc" => d.rc.set_layer_rc(&mut d.db, units(&liberty).map_err(Stop::Refused)?, &args).map_err(Stop::Refused)?,
+                "set_layer_rc" => d.rc.set_layer_rc(&mut d.db, units(&d.liberty).map_err(Stop::Refused)?, &args).map_err(Stop::Refused)?,
                 "set_dont_use" => {
                     for a in &args {
                         for pat in a.split_whitespace() {
@@ -549,6 +633,7 @@ fn run(job: &Value) -> Result<Value, String> {
                             leaf_pins: c.sources.iter().filter(|x| !x.is_empty()).map(|x| if d.bterms.contains(x) { Pin::Port(x.clone()) } else { Pin::Term(split_iterm(x)) }).collect(),
                         })
                         .collect();
+                    d.sdc = Some(s);
                 }
                 "set_routing_alpha" => d.routing_alpha_set = true,
                 "set_max_fanout" => {

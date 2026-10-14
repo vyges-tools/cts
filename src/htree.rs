@@ -402,14 +402,7 @@ impl<'a> HTree<'a> {
 
     /// `findBlockage`: the first blockage containing the point (strictly), scaled down.
     fn find_blockage(&self, p: P, scaling: f64) -> Option<(f64, f64, f64, f64)> {
-        let (bx, by) = (p.x * scaling, p.y * scaling);
-        for &(x1, y1, x2, y2) in &self.d.blockages {
-            let (x1, y1, x2, y2) = (f64::from(x1), f64::from(y1), f64::from(x2), f64::from(y2));
-            if Self::is_inside_bbox(bx, by, x1, y1, x2, y2) {
-                return Some((x1 / scaling, y1 / scaling, x2 / scaling, y2 / scaling));
-            }
-        }
-        None
+        find_blockage(&self.d.blockages, p, scaling)
     }
 
     /// `checkLegalitySpecial`.
@@ -423,47 +416,18 @@ impl<'a> HTree<'a> {
     /// `TreeBuilder::legalizeOneBuffer`: a buffer on a blockage moves to the nearest free candidate
     /// around its edges.
     fn tree_legalize_one_buffer(&self, loc: P, buffer: &str) -> P {
-        if self.o.obstruction_aware {
-            let unit = f64::from(self.lut.length_unit);
-            if let Some((x1, y1, x2, y2)) = self.find_blockage(loc, unit) {
-                let &(mw, mh) = self.d.master_size.get(buffer).expect("a buffer master in the database");
-                let (bx, by) = (loc.x, loc.y);
-                let w = f64::from(mw) / unit;
-                let h = f64::from(mh) / unit;
-                let new_x = x1 - w;
-                let new_y = y1 - h;
-                let candidates = [
-                    P::new(new_x, by),
-                    P::new(new_x, by + h),
-                    P::new(new_x, by - h),
-                    P::new(x2, by),
-                    P::new(x2, by + h),
-                    P::new(x2, by - h),
-                    P::new(bx, new_y),
-                    P::new(bx + w, new_y),
-                    P::new(bx - w, new_y),
-                    P::new(bx, y2),
-                    P::new(bx + w, y2),
-                    P::new(bx - w, y2),
-                ];
-                let mut min_dist = f64::MAX;
-                let no_best = P::new(-1e6, -1e6);
-                let mut best = no_best;
-                for c in candidates {
-                    if !self.is_occupied_loc(c) {
-                        let dist = self.compute_dist(c, loc);
-                        if dist < min_dist {
-                            min_dist = dist;
-                            best = c;
-                        }
-                    }
-                }
-                if !best.same(no_best) {
-                    return best;
-                }
-            }
-        }
-        loc
+        self.legalizer_view().tree_legalize_one_buffer(loc, buffer)
+    }
+
+    /// The legalizer's state as a view the one-buffer legalizer reads.
+    fn legalizer_view(&self) -> LegalizerView<'_> {
+        LegalizerView { obstruction_aware: self.o.obstruction_aware, length_unit: self.lut.length_unit, wire_segment_unit: self.wire_segment_unit, blockages: &self.d.blockages, master_size: &self.d.master_size, occupied: &self.occupied, map_location_to_sink: &self.map_location_to_sink }
+    }
+
+    /// A copy of the legalizer's state after the tree is built: later stages (the latency
+    /// balancer's delay buffers) legalize through the root tree's (`root_->legalizeOneBuffer`).
+    pub fn legalizer(&self) -> Legalizer {
+        Legalizer { obstruction_aware: self.o.obstruction_aware, length_unit: self.lut.length_unit, wire_segment_unit: self.wire_segment_unit, blockages: self.d.blockages.clone(), master_size: self.d.master_size.clone(), occupied: self.occupied.clone(), map_location_to_sink: self.map_location_to_sink.keys().copied().collect() }
     }
 
     /// `checkLegalityLoc`: not occupied, inside the core, on no blockage.
@@ -502,18 +466,7 @@ impl<'a> HTree<'a> {
     /// `resolveLocationCollision`: shift right by 1/unit steps until no sink sits at the point (as
     /// floats).
     fn resolve_location_collision(&self, legal: P) -> P {
-        let mut resolved = legal;
-        let mut jitter = 0u32;
-        loop {
-            let check = P::new(f64::from(resolved.x as f32), f64::from(resolved.y as f32));
-            if !self.map_location_to_sink.contains_key(&check.key()) {
-                break;
-            }
-            jitter += 1;
-            let offset = f64::from(jitter) / f64::from(self.wire_segment_unit);
-            resolved.x = legal.x + offset;
-        }
-        resolved
+        self.legalizer_view().resolve_location_collision(legal)
     }
 
     /// `run`: the call sequence.
@@ -1472,6 +1425,122 @@ impl<'a> HTree<'a> {
             log.trace(format!("VYGHTN|{}|{}|{}|{}", n.name, u8::from(n.leaf), self.clock.inst(n.insts[0]).name, sinks.join(",")));
         }
         log.trace(format!("VYGHTE|{}|{}|{}", self.clock.name, self.tree_buf_levels, self.clock.max_level));
+    }
+}
+
+/// What `HTreeBuilder::legalizeOneBuffer` reads: the tree legalizer's blockages and occupied
+/// locations, then the sink map the collision jitter avoids.
+struct LegalizerView<'a> {
+    obstruction_aware: bool,
+    length_unit: u32,
+    wire_segment_unit: i32,
+    blockages: &'a [(i32, i32, i32, i32)],
+    master_size: &'a HashMap<String, (i32, i32)>,
+    occupied: &'a HashSet<(u64, u64)>,
+    map_location_to_sink: &'a HashMap<(u64, u64), InstRef>,
+}
+
+impl LegalizerView<'_> {
+    fn find_blockage(&self, p: P, scaling: f64) -> Option<(f64, f64, f64, f64)> {
+        find_blockage(self.blockages, p, scaling)
+    }
+
+    /// `TreeBuilder::legalizeOneBuffer`: a buffer on a blockage moves to the nearest free candidate
+    /// around its edges.
+    fn tree_legalize_one_buffer(&self, loc: P, buffer: &str) -> P {
+        if self.obstruction_aware {
+            let unit = f64::from(self.length_unit);
+            if let Some((x1, y1, x2, y2)) = self.find_blockage(loc, unit) {
+                let &(mw, mh) = self.master_size.get(buffer).expect("a buffer master in the database");
+                let (bx, by) = (loc.x, loc.y);
+                let w = f64::from(mw) / unit;
+                let h = f64::from(mh) / unit;
+                let new_x = x1 - w;
+                let new_y = y1 - h;
+                let candidates = [
+                    P::new(new_x, by),
+                    P::new(new_x, by + h),
+                    P::new(new_x, by - h),
+                    P::new(x2, by),
+                    P::new(x2, by + h),
+                    P::new(x2, by - h),
+                    P::new(bx, new_y),
+                    P::new(bx + w, new_y),
+                    P::new(bx - w, new_y),
+                    P::new(bx, y2),
+                    P::new(bx + w, y2),
+                    P::new(bx - w, y2),
+                ];
+                let mut min_dist = f64::MAX;
+                let no_best = P::new(-1e6, -1e6);
+                let mut best = no_best;
+                for c in candidates {
+                    if !self.occupied.contains(&c.key()) {
+                        // `computeDist` (no insertion delay is modelled).
+                        let dist = c.dist(loc) + 0.0 + 0.0;
+                        if dist < min_dist {
+                            min_dist = dist;
+                            best = c;
+                        }
+                    }
+                }
+                if !best.same(no_best) {
+                    return best;
+                }
+            }
+        }
+        loc
+    }
+
+    /// `resolveLocationCollision`: shift right by 1/unit steps until no sink sits at the point (as
+    /// floats).
+    fn resolve_location_collision(&self, legal: P) -> P {
+        let mut resolved = legal;
+        let mut jitter = 0u32;
+        loop {
+            let check = P::new(f64::from(resolved.x as f32), f64::from(resolved.y as f32));
+            if !self.map_location_to_sink.contains_key(&check.key()) {
+                break;
+            }
+            jitter += 1;
+            let offset = f64::from(jitter) / f64::from(self.wire_segment_unit);
+            resolved.x = legal.x + offset;
+        }
+        resolved
+    }
+}
+
+/// `findBlockage`: the first blockage containing the point (strictly), scaled down.
+fn find_blockage(blockages: &[(i32, i32, i32, i32)], p: P, scaling: f64) -> Option<(f64, f64, f64, f64)> {
+    let (bx, by) = (p.x * scaling, p.y * scaling);
+    for &(x1, y1, x2, y2) in blockages {
+        let (x1, y1, x2, y2) = (f64::from(x1), f64::from(y1), f64::from(x2), f64::from(y2));
+        if x1 < bx && bx < x2 && y1 < by && by < y2 {
+            return Some((x1 / scaling, y1 / scaling, x2 / scaling, y2 / scaling));
+        }
+    }
+    None
+}
+
+/// A tree's legalizer state kept after it is built (see [`HTree::legalizer`]).
+#[derive(Debug, Clone, Default)]
+pub struct Legalizer {
+    obstruction_aware: bool,
+    length_unit: u32,
+    wire_segment_unit: i32,
+    blockages: Vec<(i32, i32, i32, i32)>,
+    master_size: HashMap<String, (i32, i32)>,
+    occupied: HashSet<(u64, u64)>,
+    map_location_to_sink: HashSet<(u64, u64)>,
+}
+
+impl Legalizer {
+    /// `HTreeBuilder::legalizeOneBuffer` on the kept state (nothing committed).
+    pub fn legalize_one_buffer(&self, loc: P, buffer: &str) -> P {
+        let map: HashMap<(u64, u64), InstRef> = self.map_location_to_sink.iter().map(|k| (*k, InstRef::Sink(0))).collect();
+        let v = LegalizerView { obstruction_aware: self.obstruction_aware, length_unit: self.length_unit, wire_segment_unit: self.wire_segment_unit, blockages: &self.blockages, master_size: &self.master_size, occupied: &self.occupied, map_location_to_sink: &map };
+        let legal = v.tree_legalize_one_buffer(loc, buffer);
+        v.resolve_location_collision(legal)
     }
 }
 
