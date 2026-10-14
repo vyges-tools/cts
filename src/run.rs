@@ -2,17 +2,20 @@
 //! The command and its sequence: `clock_tree_synthesis` (the Tcl proc: its options, in its order)
 //! and `runTritonCts`, each stage its own function, in the reference's order.
 //!
-//! Modelled so far (slice 1): the setup up to the characterization buffer, clock-net discovery,
-//! and the run that finds no clock net. A run that finds one stops after discovery
-//! ([`Outcome::Discovered`]): characterization and tree building are later slices.
+//! Modelled so far: the setup and the characterization, clock-net discovery, the run that finds
+//! no clock net, and each tree's H-tree built in memory ([`Outcome::Built`]). Writing the trees
+//! to the database is the next slice.
 
 use crate::buffers::{self, BufferLibs};
 use crate::discovery::{self, ClockDesign, Found, SdcClock, Setup};
 use crate::log::{refuse, Log, Res};
 use crate::options::{self, Masters, Options};
 
+/// A rectangle `(x0, y0, x1, y1)` in DBU.
+pub type Rect = (i32, i32, i32, i32);
+
 /// What the design must answer for a run.
-pub trait Design: ClockDesign + BufferLibs + crate::techchar::CharDesign {
+pub trait Design: ClockDesign + BufferLibs + crate::techchar::CharDesign + crate::write::TreeDb {
     /// `block->getCoreArea()` width and height, and DBU per micron.
     fn core_size(&self) -> (i32, i32);
     fn dbu(&self) -> i32;
@@ -30,6 +33,19 @@ pub trait Design: ClockDesign + BufferLibs + crate::techchar::CharDesign {
     /// `Resizer::findMaxWireLength(false)` in meters: the least over the scenes with a signal wire
     /// resistance and the resizer's buffers; `-inf` when no scene has one.
     fn find_max_wire_length(&self) -> Res<f64>;
+    /// The non-via shapes of an instance terminal (`dbITermShapeItr`), placed: `(x0, y0, x1, y1)`.
+    fn iterm_shape_boxes(&self, inst: &str, pin: &str) -> Vec<(i32, i32, i32, i32)>;
+    /// `block->getCoreArea()` as `(xMin, yMin, xMax, yMax)`.
+    fn core_area(&self) -> (i32, i32, i32, i32);
+    /// A master's width and height (DBU), `None` when absent.
+    fn master_size(&self, name: &str) -> Option<(i32, i32)>;
+    /// `mergeBlockages`: placed block instances (grown by hard halos) and hard placement
+    /// blockages, bloated then shrunk by the margins: the blocks' largest width and height, and
+    /// the merged regions' extents, in order.
+    fn merge_blockages(&self, bloat_w: i32, bloat_h: i32) -> (u32, u32, Vec<Rect>);
+    /// `getBufferFanoutLimit`: the least of the design's, the buffer output port's and cell's SDC
+    /// fanout limits and the liberty port's (else the library default) max fanout; 0 for none.
+    fn buffer_fanout_limit(&self, buffer: &str) -> Res<i32>;
 }
 
 struct M<'a>(&'a dyn Design);
@@ -45,8 +61,10 @@ impl Masters for M<'_> {
 pub enum Outcome {
     /// No valid clock net (CTS-0082): the command's whole output.
     NoClockNets,
-    /// Clock nets found; the run stops here (later slices build the trees).
-    Discovered(Found),
+    /// Clock nets found and each tree built in memory, the writing not modelled for this run.
+    Built(Found, Vec<crate::htree::Clock>),
+    /// The trees written to the database and reported: the command's whole output.
+    Done(Found),
 }
 
 /// The `clock_tree_synthesis` proc: obsolete-flag warnings, then each option in the proc's order,
@@ -135,25 +153,223 @@ pub fn clock_tree_synthesis(o: &mut Options, log: &mut Log, d: &mut dyn Design, 
 
 /// `runTritonCts`, as far as it is modelled.
 pub fn run_triton_cts(o: &mut Options, log: &mut Log, d: &mut dyn Design) -> Res<Outcome> {
-    let (root, sink) = setup_characterization(o, log, d)?;
-    find_clock_roots(o, log);
-    let found = populate_triton_cts(o, log, d, &root)?;
-    let _ = sink; // read by the trees (later slices)
+    let r = run_stages(o, log, d);
     // The end-of-run reset (`rootBuffers_`, `sinkBuffers_` cleared, the max wire length 0).
     o.root_buffers.clear();
     o.sink_buffers.clear();
     o.max_wl = Ok(0);
+    r
+}
+
+/// The command's stages, in order.
+fn run_stages(o: &mut Options, log: &mut Log, d: &mut dyn Design) -> Res<Outcome> {
+    let (root, sink, mut lut, char_setup, max_fanout) = setup_characterization(o, log, d)?;
+    find_clock_roots(o, log);
+    let found = populate_triton_cts(o, log, d, &root)?;
     if found.builders.is_empty() {
         log.warn("CTS", 82, "No valid clock nets in the design.");
         return Ok(Outcome::NoClockNets);
     }
-    Ok(Outcome::Discovered(found))
+    check_characterization(log, d, &lut)?;
+    let ho = tree_options(o, d, &root, &sink, char_setup, max_fanout)?;
+    let mut ho = ho;
+    let mut trees = build_clock_trees(log, d, &mut ho, &mut lut, &found)?;
+    // `-apply_ndr` (default half); a value the command's type check rejects is refused.
+    let ndr = match o.other.get("-apply_ndr") {
+        None => crate::write::Ndr::Half,
+        Some(v) => crate::write::Ndr::parse(v).ok_or_else(|| crate::log::Stop::Refused(format!("-apply_ndr {v}: not a strategy")))?,
+    };
+    let wo = crate::write::WOptions { dummy_load: o.other.get("dummy_load").is_none_or(|v| v == "true"), max_fanout: ho.max_fanout, buffer_list: o.buffer_list.clone(), db_units: d.dbu(), ndr };
+    let mut w = crate::write::Writer::default();
+    crate::write::write_data_to_db(log, d, &mut w, &wo, &mut trees)?;
+    // `setAllClocksPropagated` prints nothing; the clock-net repair and the latency balancing that
+    // follow are later slices.
+    if o.other.get("repair_clock_nets").is_some_and(|v| v == "true") {
+        return refuse("-repair_clock_nets is not modelled");
+    }
+    if o.insertion_delay && trees.iter().any(|t| t.parent.is_none() && t.has_children) {
+        return refuse("latency balancing (a tree with sub-trees) is not modelled");
+    }
+    Ok(Outcome::Done(found))
+}
+
+/// `checkCharacterization`: every buffer master the segments use exists; CTS-0097 counts them.
+fn check_characterization(log: &mut Log, d: &dyn Design, lut: &crate::techchar::Lut) -> Res<()> {
+    let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for seg in &lut.segments {
+        for m in &seg.buffer_masters {
+            if !visited.contains(m.as_str()) {
+                if d.has_master(m) {
+                    visited.insert(m);
+                } else {
+                    return log.error("CTS", 81, format!("Buffer {m} is not in the loaded DB."));
+                }
+            }
+        }
+    }
+    log.info("CTS", 97, format!("Characterization used {} buffer(s) types.", visited.len()));
+    Ok(())
+}
+
+/// The options the tree reads, as the command and the setup left them.
+fn tree_options(o: &Options, d: &dyn Design, root: &str, sink: &str, char_setup: (u32, f64, f64), limits: (i32, i32)) -> Res<crate::htree::HOptions> {
+    let (unit, cap_per_dbu, sink_buffer_input_cap) = char_setup;
+    let get = |k: &str| o.other.get(k).map(|v| options::num(v)).transpose();
+    // `ord::microns_to_dbu`: rounded.
+    let dbu_of = |k: &str| -> Res<Option<i32>> { Ok(get(k)?.map(|v| (v * f64::from(d.dbu())).round() as i32)) };
+    let buffer_distance = dbu_of("-distance_between_buffers")?;
+    let vertex_distance = dbu_of("-branching_point_buffers_distance")?;
+    let (root_max_fanout, sink_max_fanout) = limits;
+    // `setupCharacterization`: the root buffer's limit when below the leaf sinks (15); the sink
+    // buffer's caps the clustering sizes and, when lower, the max fanout.
+    let mut max_fanout = 0u32;
+    if root_max_fanout != 0 && 15 > root_max_fanout as u32 {
+        max_fanout = root_max_fanout as u32;
+    }
+    let mut size = get("-sink_clustering_size")?.map(|v| v as u32);
+    let mut macro_size = get("-macro_clustering_size")?.map(|v| v as u32);
+    if sink_max_fanout != 0 {
+        // `limitSinkClusteringSizes` (sets the size, so it counts as given).
+        let limit = sink_max_fanout as u32;
+        size = Some(size.map_or(limit, |s| limit.min(s)));
+        if (sink_max_fanout as u32) < max_fanout {
+            max_fanout = sink_max_fanout as u32;
+        }
+    }
+    let _ = &mut macro_size;
+    let diameter = get("-sink_clustering_max_diameter")?;
+    let macro_diameter = get("-macro_clustering_max_diameter")?;
+    Ok(crate::htree::HOptions {
+        root_buffer: root.into(),
+        sink_buffer: sink.into(),
+        tree_buffer: o.other.get("-tree_buf").cloned(),
+        sink_clustering: o.other.get("sink_clustering").is_some_and(|v| v == "true"),
+        max_diameter: diameter.unwrap_or(50.0),
+        max_diameter_set: diameter.is_some(),
+        sink_clustering_size: size.unwrap_or(30),
+        sink_clustering_size_set: size.is_some(),
+        macro_max_diameter: macro_diameter.unwrap_or(50.0),
+        macro_max_diameter_set: macro_diameter.is_some(),
+        macro_sink_clustering_size: macro_size.unwrap_or(4),
+        macro_sink_clustering_size_set: true,
+        num_static_layers: get("-num_static_layers")?.map_or(0, |v| v as u32),
+        clustering_power: get("-clustering_exponent")?.map_or(4, |v| v as u32),
+        clustering_capacity: get("-clustering_unbalance_ratio")?.unwrap_or(0.6),
+        max_fanout,
+        max_wl: o.max_wl.clone()?,
+        wire_segment_unit: unit,
+        db_units: d.dbu(),
+        max_slew: 4,
+        num_max_leaf_sinks: 15,
+        clock_tree_max_depth: 100,
+        fake_lut_entries: true,
+        obstruction_aware: o.other.get("obstruction_aware").is_none_or(|v| v != "false"),
+        buffer_distance: buffer_distance.unwrap_or(100 * d.dbu()),
+        sink_buffer_input_cap,
+        cap_per_dbu,
+        sink_clustering_levels: get("-sink_clustering_levels")?.map_or(0, |v| v as u32),
+        simple_segments: buffer_distance.is_some(),
+        vertex_buffers: vertex_distance.is_some(),
+        vertex_buffer_distance: vertex_distance.unwrap_or(240 * d.dbu()),
+    })
+}
+
+/// `computeITermPosition`: the mean of the terminal's non-via shape centres (integer arithmetic).
+fn iterm_position(d: &dyn Design, inst: &str, pin: &str) -> (i32, i32) {
+    let (mut x, mut y, mut n) = (0i32, 0i32, 0i32);
+    for (x0, y0, x1, y1) in d.iterm_shape_boxes(inst, pin) {
+        x += x0 + (x1 - x0) / 2;
+        y += y0 + (y1 - y0) / 2;
+        n += 1;
+    }
+    if n > 0 {
+        x /= n;
+        y /= n;
+    }
+    (x, y)
+}
+
+/// `buildClockTrees`: each builder's blockages, then its tree.
+fn build_clock_trees(log: &mut Log, d: &dyn Design, ho: &mut crate::htree::HOptions, lut: &mut crate::techchar::Lut, found: &Found) -> Res<Vec<crate::write::Tree>> {
+    use crate::htree::{Clock, ClockInst, HDesign, HTree, TreeType};
+    let mut master_size = std::collections::HashMap::new();
+    for s in &lut.segments {
+        for m in &s.buffer_masters {
+            if let Some(sz) = d.master_size(m) {
+                master_size.insert(m.clone(), sz);
+            }
+        }
+    }
+    for m in [&ho.root_buffer, &ho.sink_buffer].into_iter().chain(ho.tree_buffer.as_ref()) {
+        if let Some(sz) = d.master_size(m) {
+            master_size.insert(m.clone(), sz);
+        }
+    }
+    let mut out = Vec::new();
+    for b in &found.builders {
+        let tree_type = match b.tree_type {
+            Some("MacroTree") => TreeType::Macro,
+            Some("RegisterTree") => TreeType::Register,
+            _ => TreeType::Regular,
+        };
+        let mut clock = Clock::new(&b.net);
+        for s in &b.sinks {
+            let (inst, pin) = s.rsplit_once('/').ok_or_else(|| crate::log::Stop::Refused(format!("sink {s}: not inst/pin")))?;
+            let (x, y) = iterm_position(d, inst, pin);
+            let input_cap = crate::write::input_pin_cap(d, &(inst.to_string(), pin.to_string()));
+            clock.sinks.push(ClockInst { name: s.clone(), master: String::new(), x, y, insertion_delay: 0.0, input_cap });
+        }
+        // `initBlockages`: the tree (else root) buffer's size sets the merge margins.
+        let buffer = ho.tree_buffer.clone().unwrap_or_else(|| ho.root_buffer.clone());
+        let blockages = match master_size.get(&buffer) {
+            Some(&(w, h)) => {
+                let unit = f64::from(lut.length_unit);
+                let (bw, bh) = (f64::from(w) / unit, f64::from(h) / unit);
+                let (max_dx, max_dy, rects) = d.merge_blockages((bw * unit / 2.0).ceil() as i32, (bh * unit / 2.0).ceil() as i32);
+                // The macro clustering diameter becomes twice the largest block (microns) unless
+                // given — and stays set for the trees after this one.
+                let max_diameter = f64::from(2 * max_dx.max(max_dy)) / f64::from(d.dbu());
+                if max_diameter != 0.0 && !ho.macro_max_diameter_set {
+                    ho.macro_max_diameter = max_diameter.max(ho.macro_max_diameter);
+                    ho.macro_max_diameter_set = true;
+                }
+                rects
+            }
+            None => Vec::new(),
+        };
+        let hd = HDesign { core: d.core_area(), blockages, master_size: master_size.clone() };
+        let mut t = HTree::new(ho, &hd, lut, clock, tree_type);
+        // The register tree's top buffer was named when its net was forked.
+        if let Some(top) = &b.top_buffer {
+            t.top_buffer_name = top.clone();
+        }
+        t.init_blockages(log)?;
+        t.run(log)?;
+        t.probe_tree(log);
+        let driving_net = (tree_type == TreeType::Register).then(|| b.parent.map(|p| found.builders[p].net.clone())).flatten();
+        let index = out.len();
+        out.push(crate::write::Tree {
+            net: b.net.clone(),
+            tree_type,
+            top_buffer_name: t.top_buffer_name.clone(),
+            driving_net,
+            parent: b.parent,
+            has_children: found.builders.iter().any(|c| c.parent == Some(index)),
+            tree_buffers: t.tree_level_buffers.iter().copied().collect(),
+            leaf_buffers: t.first_level_sink_drivers.iter().chain(&t.second_level_sink_drivers).copied().collect(),
+            n_dummies: 0,
+            removed_subnets: Default::default(),
+            clock: t.clock,
+        });
+    }
+    Ok(out)
 }
 
 /// `setupCharacterization`: the library check, the root and sink buffers, then the
 /// characterization's opening (`TechChar::create` → `initCharacterization` up to the
 /// characterization buffer). Returns the root and sink buffers.
-fn setup_characterization(o: &mut Options, log: &mut Log, d: &mut dyn Design) -> Res<(String, String)> {
+#[allow(clippy::type_complexity)]
+fn setup_characterization(o: &mut Options, log: &mut Log, d: &mut dyn Design) -> Res<(String, String, crate::techchar::Lut, (u32, f64, f64), (i32, i32))> {
     if let Some(l) = &o.cts_library {
         if !d.has_library(l) {
             return log.error("CTS", 209, format!("Library {l} cannot be found because it is not loaded or name is incorrect"));
@@ -163,7 +379,9 @@ fn setup_characterization(o: &mut Options, log: &mut Log, d: &mut dyn Design) ->
     let (core, dbu, cap) = (d.core_size(), d.dbu(), d.wire_signal_cap());
     let root = buffers::select_root_buffer(o, log, d, core, dbu, cap)?;
     let sink = buffers::select_sink_buffer(o, log, d, core, dbu, cap)?;
-    // The buffers' fanout limits set options the trees read (later).
+    // The buffers' fanout limits set options the trees read (`tree_options`).
+    let sink_max_fanout = d.buffer_fanout_limit(&sink)?;
+    let root_max_fanout = d.buffer_fanout_limit(&root)?;
     // The max wire length (DBU, `micronsToDbu` rounds): clock-gate cloning's threshold.
     o.max_wl = d.find_max_wire_length().map(|m| {
         let microns = m * 1e6;
@@ -173,12 +391,13 @@ fn setup_characterization(o: &mut Options, log: &mut Log, d: &mut dyn Design) ->
             0
         }
     });
-    init_characterization(o, log, d, &root, &sink)?;
-    Ok((root, sink))
+    let (lut, unit) = init_characterization(o, log, d, &root, &sink)?;
+    Ok((root, sink, lut, unit, (root_max_fanout, sink_max_fanout)))
 }
 
 /// `TechChar::initCharacterization`, to the characterization buffer.
-fn init_characterization(o: &Options, log: &mut Log, d: &dyn Design, root: &str, sink: &str) -> Res<(String, Vec<f32>, Vec<f32>)> {
+/// Returns the table and (the characterization unit, capacitance per DBU, sink buffer input cap).
+fn init_characterization(o: &Options, log: &mut Log, d: &dyn Design, root: &str, sink: &str) -> Res<(crate::techchar::Lut, (u32, f64, f64))> {
     init_clock_layer_res_cap(log, d);
     if o.buffer_list.is_empty() {
         return log.error("CTS", 73, "Buffer not found. Check your -buf_list input.");
@@ -206,7 +425,7 @@ fn init_characterization(o: &Options, log: &mut Log, d: &dyn Design, root: &str,
     log.trace(probe);
     let (lut, _) = crate::techchar::create(log, d, &setup)?;
     crate::techchar::probe_segments(log, &lut);
-    Ok((char_buf, slews, loads))
+    Ok((lut, (setup.unit, setup.cap_per_dbu, setup.sink_buffer_input_cap)))
 }
 
 /// `TechChar::initClockLayerResCap`: CTS-0104 when the clock wire's resistance or capacitance per

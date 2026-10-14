@@ -96,6 +96,10 @@ struct CliDesign {
     /// `dbNet` ids by name (the block's net order).
     net_ids: HashMap<String, u32>,
     bterms: HashSet<String>,
+    /// The SDC has `set_max_fanout` (its limits are not modelled).
+    sdc_max_fanout: bool,
+    /// `set_max_fanout` on a cell (`Sdc::setFanoutLimit(Cell*)`): the last value given.
+    cell_max_fanout: HashMap<String, f32>,
 }
 
 impl CliDesign {
@@ -266,6 +270,103 @@ impl ClockDesign for CliDesign {
     }
 }
 
+impl vyges_cts::write::TreeDb for CliDesign {
+    fn iterm_io_type(&self, t: &ITerm) -> String {
+        self.db.iterm_get_io_type(&t.0, &t.1)
+    }
+    fn inst_first_output(&self, inst: &str) -> Option<ITerm> {
+        // odb names the terminal `inst/pin`.
+        some(self.db.inst_get_first_output(inst)).map(|n| (inst.to_string(), n.strip_prefix(&format!("{inst}/")).map(String::from).unwrap_or(n)))
+    }
+    fn net_sig_type(&self, net: &str) -> String {
+        self.db.net_get_sig_type(net)
+    }
+    fn net_iterm_count(&self, net: &str) -> u32 {
+        self.db.net_get_i_term_count(net)
+    }
+    fn net_input_port_xy(&self, net: &str) -> Option<(i32, i32)> {
+        let mut at = None;
+        for b in self.db.net_get_b_terms(net) {
+            if self.db.bterm_get_io_type(&b) != "INPUT" {
+                continue;
+            }
+            for i in 0..self.db.num_bterm_get_b_pins(&b) {
+                let s = self.db.bpin_get_placement_status(&b, i);
+                if s == "NONE" || s == "UNPLACED" {
+                    continue;
+                }
+                if let Some(&(_, x0, y0, _, _)) = self.db.bpin_layer_boxes(&b, i).ok().as_ref().and_then(|v| v.first()) {
+                    at = Some((x0, y0));
+                }
+                break;
+            }
+        }
+        at
+    }
+    fn connect(&mut self, t: &ITerm, net: &str) -> Res<()> {
+        self.db.connect(&t.0, &t.1, net).map_err(|e| Stop::Refused(format!("connect {}/{} {net}: {e}", t.0, t.1)))
+    }
+    fn disconnect(&mut self, t: &ITerm) -> Res<()> {
+        self.db.disconnect(&t.0, &t.1).map_err(|e| Stop::Refused(format!("disconnect {}/{}: {e}", t.0, t.1)))
+    }
+    fn create_placed_inst(&mut self, master: &str, name: &str, x: i32, y: i32) -> Res<()> {
+        let e = |e: vyges_opendb::Error| Stop::Refused(format!("create {name}: {e}"));
+        self.db.create_inst(master, name).map_err(e)?;
+        self.db.inst_set_source_type(name, "TIMING").map_err(e)?;
+        self.db.set_inst_location(name, x, y).map_err(e)?;
+        self.db.inst_set_placement_status(name, "PLACED").map_err(e)
+    }
+    fn create_clock_net(&mut self, name: &str) -> Res<()> {
+        let e = |e: vyges_opendb::Error| Stop::Refused(format!("create net {name}: {e}"));
+        if self.net_ids.contains_key(name) {
+            return vyges_cts::log::refuse(format!("net {name} already exists (the reference's create would fail)"));
+        }
+        self.db.create_net(name).map_err(e)?;
+        self.db.net_set_sig_type(name, "CLOCK").map_err(e)?;
+        self.net_ids.insert(name.to_string(), self.net_ids.len() as u32);
+        Ok(())
+    }
+    fn set_net_clock(&mut self, net: &str) -> Res<()> {
+        self.db.net_set_sig_type(net, "CLOCK").map_err(|e| Stop::Refused(format!("{net}: {e}")))
+    }
+    fn destroy_net(&mut self, net: &str) -> Res<()> {
+        self.db.destroy_net(net).map_err(|e| Stop::Refused(format!("destroy {net}: {e}")))?;
+        self.net_ids.remove(net);
+        Ok(())
+    }
+    fn destroy_inst(&mut self, inst: &str) -> Res<()> {
+        self.db.destroy_inst(inst).map_err(|e| Stop::Refused(format!("destroy {inst}: {e}")))
+    }
+    fn resizer_dont_use_cell(&self, cell: &str) -> bool {
+        self.dont_use.contains(cell)
+    }
+    fn iterm_avg_xy_logged(&mut self, t: &ITerm) -> (Option<(i32, i32)>, Vec<String>) {
+        let (at, text) = self.db.with_captured_logs(|db| db.iterm_avg_xy(&t.0, &t.1));
+        (at, text.lines().map(String::from).filter(|l| !l.is_empty()).collect())
+    }
+    fn liberty_libraries(&self) -> &[Library] {
+        &self.libs
+    }
+    fn routing_layers(&self) -> Vec<(String, i32, i32, bool)> {
+        let mut layers: Vec<(i32, String)> = self.db.tech_get_layers().into_iter().map(|l| (self.db.layer_get_routing_level(&l), l)).filter(|(lv, _)| *lv > 0).collect();
+        layers.sort_by_key(|(lv, _)| *lv);
+        layers.into_iter().map(|(_, l)| (l.clone(), self.db.layer_get_width(&l) as i32, self.db.layer_get_pitch(&l), self.db.layer_is_backside(&l))).collect()
+    }
+    fn create_ndr(&mut self, name: &str) -> Res<bool> {
+        self.db.ndr_create(name).map_err(|e| Stop::Refused(format!("NDR {name}: {e}")))
+    }
+    fn set_ndr_layer(&mut self, ndr: &str, layer: &str, width: i32, spacing: i32) -> Res<()> {
+        let e = |e: vyges_opendb::Error| Stop::Refused(format!("NDR {ndr} {layer}: {e}"));
+        if !self.db.ndr_set_layer_width(ndr, layer, width).map_err(e)? || !self.db.ndr_set_layer_spacing(ndr, layer, spacing).map_err(e)? {
+            return vyges_cts::log::refuse(format!("NDR {ndr}: no layer {layer}"));
+        }
+        Ok(())
+    }
+    fn set_net_ndr(&mut self, net: &str, ndr: &str) -> Res<()> {
+        self.db.net_set_non_default_rule(net, ndr).map_err(|e| Stop::Refused(format!("{net} NDR {ndr}: {e}")))
+    }
+}
+
 impl vyges_cts::techchar::CharDesign for CliDesign {
     fn master_height(&self, name: &str) -> i32 {
         self.db.master_get_height(name) as i32
@@ -328,6 +429,46 @@ impl Design for CliDesign {
         let mut lengths = Vec::new();
         vyges_rsz::max_wire_length::find_max_wire_length(&ctx, &mut lengths).map_err(|e| Stop::Refused(format!("findMaxWireLength: {}", e.message())))
     }
+    fn iterm_shape_boxes(&self, inst: &str, pin: &str) -> Vec<(i32, i32, i32, i32)> {
+        self.db.iterm_shape_boxes(inst, pin)
+    }
+    fn core_area(&self) -> (i32, i32, i32, i32) {
+        (self.db.block_get_core_area_x_min(), self.db.block_get_core_area_y_min(), self.db.block_get_core_area_x_max(), self.db.block_get_core_area_y_max())
+    }
+    fn master_size(&self, name: &str) -> Option<(i32, i32)> {
+        self.masters.contains(name).then(|| (self.db.master_get_width(name) as i32, self.db.master_get_height(name) as i32))
+    }
+    fn merge_blockages(&self, bloat_w: i32, bloat_h: i32) -> (u32, u32, Vec<vyges_cts::run::Rect>) {
+        self.db.cts_merge_blockages(bloat_w, bloat_h)
+    }
+    fn buffer_fanout_limit(&self, buffer: &str) -> Res<i32> {
+        if self.sdc_max_fanout {
+            return vyges_cts::log::refuse("set_max_fanout (the SDC fanout limits) is not modelled");
+        }
+        let mut fanout = i32::MAX;
+        // The first output terminal that is not a supply.
+        let out = self.db.master_get_m_terms(buffer).into_iter().find(|t| {
+            let sig = self.db.mterm_get_sig_type(buffer, t);
+            sig != "POWER" && sig != "GROUND" && self.db.mterm_get_io_type(buffer, t) == "OUTPUT"
+        });
+        // Without an output port only the design's limit (none modelled) is read: 0.
+        let Some(out) = out else { return Ok(0) };
+        if let Some(&f) = self.cell_max_fanout.get(buffer) {
+            fanout = fanout.min(f as i32);
+        }
+        let Some((lib, cell)) = self.libs.iter().find_map(|l| l.cells.get(buffer).map(|c| (l, c))) else {
+            return vyges_cts::log::refuse(format!("{buffer}: no liberty cell"));
+        };
+        let Some(port) = cell.ports.iter().find(|p| p.name == out) else {
+            return vyges_cts::log::refuse(format!("{buffer}/{out}: no liberty port"));
+        };
+        if let Some(f) = port.max_fanout {
+            fanout = fanout.min(f as i32);
+        } else if let Some(f) = lib.default_max_fanout {
+            fanout = fanout.min(f as i32);
+        }
+        Ok(if fanout == i32::MAX { 0 } else { fanout })
+    }
 }
 
 fn read_text(path: &str) -> Result<String, String> {
@@ -335,7 +476,7 @@ fn read_text(path: &str) -> Result<String, String> {
 }
 
 fn run(job: &Value) -> Result<Value, String> {
-    let mut d = CliDesign { db: Db::new(), libs: Vec::new(), rc: vyges_est::rc::Rc::new(), tech: String::new(), clocks: Vec::new(), dont_use: BTreeSet::new(), set_dont_use: BTreeSet::new(), routing_alpha_set: false, clock_buffer_pattern: false, masters: HashSet::new(), net_ids: HashMap::new(), bterms: HashSet::new() };
+    let mut d = CliDesign { db: Db::new(), libs: Vec::new(), rc: vyges_est::rc::Rc::new(), tech: String::new(), clocks: Vec::new(), dont_use: BTreeSet::new(), set_dont_use: BTreeSet::new(), routing_alpha_set: false, clock_buffer_pattern: false, masters: HashSet::new(), net_ids: HashMap::new(), bterms: HashSet::new(), sdc_max_fanout: false, cell_max_fanout: HashMap::new() };
     let mut liberty = vyges_est::liberty::LibertyClocks::default();
     let mut o = Options::default();
     let mut log = Log::default();
@@ -399,6 +540,7 @@ fn run(job: &Value) -> Result<Value, String> {
                             return vyges_cts::log::refuse(format!("{path}: {c} (the clock network it changes) is not modelled"));
                         }
                     }
+                    d.sdc_max_fanout = s.ignored.iter().any(|i| i == "set_max_fanout");
                     d.clocks = s
                         .clocks
                         .iter()
@@ -409,6 +551,18 @@ fn run(job: &Value) -> Result<Value, String> {
                         .collect();
                 }
                 "set_routing_alpha" => d.routing_alpha_set = true,
+                "set_max_fanout" => {
+                    // `set_max_fanout value objects`: only library cells (by name) are modelled.
+                    let [value, objects] = args.as_slice() else { return vyges_cts::log::refuse(format!("set_max_fanout {}: not a value and objects", args.join(" "))) };
+                    let v: f32 = value.parse().map_err(|_| Stop::Refused(format!("set_max_fanout {value}: not a number")))?;
+                    for name in objects.split_whitespace() {
+                        if d.libs.iter().any(|l| l.cells.contains_key(name)) {
+                            d.cell_max_fanout.insert(name.to_string(), v);
+                        } else {
+                            return vyges_cts::log::refuse(format!("set_max_fanout on {name} (not a library cell) is not modelled"));
+                        }
+                    }
+                }
                 "set_cts_config" => {
                     if args.iter().any(|a| a.starts_with("-clock_buffer_")) {
                         d.clock_buffer_pattern = true;
@@ -433,11 +587,20 @@ fn run(job: &Value) -> Result<Value, String> {
                 v["clock_nets"] = json!(0);
                 return Ok(v);
             }
-            // Clock nets found: what is modelled ends here (`modelled_through`); the trees are not
-            // built, so the command is refused rather than reported as done.
-            Ok(Some(Outcome::Discovered(f))) => {
-                let mut v = finish(log, &pre, "refused", Some("characterization and clock tree building are not modelled yet".into()));
-                v["modelled_through"] = json!("discovery");
+            // Clock nets found and the trees built in memory: what is modelled ends here
+            // (`modelled_through`); nothing is written, so the command is refused rather than done.
+            // The trees written: the command is done; the design is written when the job asks.
+            Ok(Some(Outcome::Done(f))) => {
+                if let Some(path) = job["write_def"].as_str() {
+                    d.db.write_def(path).map_err(|e| format!("write_def {path}: {e}"))?;
+                }
+                let mut v = finish(log, &pre, "done", None);
+                v["clock_nets"] = json!(f.builders.len());
+                return Ok(v);
+            }
+            Ok(Some(Outcome::Built(f, _))) => {
+                let mut v = finish(log, &pre, "refused", Some("writing the clock trees to the database is not modelled yet".into()));
+                v["modelled_through"] = json!("htree");
                 v["clock_nets"] = json!(f.builders.len());
                 v["builders"] = json!(f.builders.iter().map(|b| json!({"net": b.net, "input_net": b.input_net, "clock": b.sdc_clock, "sinks": b.sinks.len(), "parent": b.parent, "tree_type": b.tree_type})).collect::<Vec<_>>());
                 return Ok(v);
@@ -495,10 +658,12 @@ OPTIONS:
   --star                star this tool on GitHub
 
 EXIT STATUS:
+  0  done         the clock trees were built, written to the design and reported
   0  up_to_date   clock nets were looked for and none was found: nothing to build
   2  vacuous      the job has no clock_tree_synthesis step. NOT a pass.
   2  error        usage, unreadable input, or an error the command raises (its line is reported)
-  3  refused      an input this engine does not model — or a clock tree to build — see `reason`
+  3  refused      an input or a stage this engine does not model — see `reason` (and
+                  `modelled_through` when the trees were built but not written)
 ";
 
 const PIN_TOKEN: &str = "@OPENROAD_PIN@";
@@ -511,11 +676,11 @@ const DESCRIBE: &str = r#"{
   "schema": "vyges-tool-descriptor/1.1",
   "openroad_pin": "@OPENROAD_PIN@",
   "name": "cts",
-  "summary": "clock tree synthesis of a placed design: clock buffers chosen, clock nets found and their sinks collected",
+  "summary": "clock tree synthesis of a placed design: clock buffers chosen, clock nets found, an H-tree built per net and written with its dummy loads",
   "maturity": "structured",
   "provenance_limitations": [
     "input_hash covers the argument vector, not the content of the job file or of the design files it names.",
-    "status is one of up_to_date, vacuous, refused or error. up_to_date means clock nets were looked for and none was found. A design WITH a clock net is refused after discovery (modelled_through: discovery): the trees are not built yet. The declared assertion passes on up_to_date only. Exit status is 0 for up_to_date, 2 for vacuous and for error, 3 for refused.",
+    "status is one of done, up_to_date, vacuous, refused or error. done means the trees were built, written and reported; up_to_date means clock nets were looked for and none was found. A run that needs a stage not yet modelled (sink clustering, clock NDRs, clock-net repair, latency balancing of sub-trees) is refused, with modelled_through: htree when the trees were built but not written. The declared assertion passes on done and up_to_date. Exit status is 0 for done and up_to_date, 2 for vacuous and for error, 3 for refused.",
     "Modelled: buffer list inference, root/sink/characterization buffer selection, clock-gate cloning, clock-net discovery through gaters and bidirect pads. Refused rather than guessed: hierarchical designs where a clone or register-tree buffer is made, insertion-delay (clock-tree-path) cells, several corners, set_disable_timing, case analysis and generated clocks."
   ],
   "invocation": {
@@ -536,7 +701,7 @@ const DESCRIBE: &str = r#"{
   "assertion": {
     "id": "clock-trees-built",
     "field": "status",
-    "pass_when": { "in": ["up_to_date"] }
+    "pass_when": { "in": ["done", "up_to_date"] }
   }
 }"#;
 
@@ -552,7 +717,7 @@ fn link(flag: &str) -> Option<(&'static str, &'static str)> {
 
 fn exit_for(status: &str) -> u8 {
     match status {
-        "up_to_date" => 0,
+        "done" | "up_to_date" => 0,
         "refused" => 3,
         _ => 2,
     }
@@ -657,7 +822,8 @@ mod tests {
 
     // Rule (vacuous convention): only a checked nothing-to-do exits 0; a refusal never does.
     #[test]
-    fn only_up_to_date_exits_zero() {
+    fn only_done_and_up_to_date_exit_zero() {
+        assert_eq!(exit_for("done"), 0);
         assert_eq!(exit_for("up_to_date"), 0);
         assert_eq!(exit_for("refused"), 3);
         assert_eq!(exit_for("vacuous"), 2);

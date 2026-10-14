@@ -11,8 +11,13 @@
 //! - [`log`]: the output lines and how a run stops.
 
 pub mod buffers;
+pub mod clustering;
 pub mod discovery;
+pub mod htree;
+pub mod lemon;
 pub mod log;
 pub mod options;
 pub mod run;
+pub mod sink_clustering;
 pub mod techchar;
+pub mod write;
