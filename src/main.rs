@@ -266,6 +266,12 @@ impl ClockDesign for CliDesign {
     }
 }
 
+impl vyges_cts::techchar::CharDesign for CliDesign {
+    fn master_height(&self, name: &str) -> i32 {
+        self.db.master_get_height(name) as i32
+    }
+}
+
 impl Design for CliDesign {
     fn core_size(&self) -> (i32, i32) {
         (self.db.block_get_core_area_dx(), self.db.block_get_core_area_dy())
@@ -338,7 +344,7 @@ fn run(job: &Value) -> Result<Value, String> {
         let u = l.units.ok_or("RC before a liberty library: the timer's default units are not modelled")?;
         Ok(vyges_est::rc::Units { resistance: u.resistance, capacitance: u.capacitance, distance: u.distance })
     };
-    let finish = |log: Log, pre: &[String], status: &str, reason: Option<String>| json!({"tool": "vyges-cts", "status": status, "reason": reason, "before": pre, "lines": log.lines});
+    let finish = |log: Log, pre: &[String], status: &str, reason: Option<String>| json!({"tool": "vyges-cts", "status": status, "reason": reason, "before": pre, "lines": log.lines, "trace": log.trace});
     for step in job["steps"].as_array().ok_or("steps")? {
         let cmd = step["cmd"].as_str().ok_or("cmd")?;
         let args: Vec<String> = step["args"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();

@@ -15,3 +15,4 @@ pub mod discovery;
 pub mod log;
 pub mod options;
 pub mod run;
+pub mod techchar;

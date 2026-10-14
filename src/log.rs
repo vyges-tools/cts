@@ -9,6 +9,8 @@ pub struct Log {
     pub lines: Vec<String>,
     /// `set_debug_level <tool> <group> <level>`.
     pub debug: BTreeMap<(String, String), i32>,
+    /// Raw-value probe lines (`VYG…`), compared with an instrumented reference's; never output.
+    pub trace: Vec<String>,
 }
 
 /// Why a run ended early: the reference's own error (its line is in the log), or a behaviour this
@@ -27,6 +29,11 @@ pub fn refuse<T>(why: impl Into<String>) -> Res<T> {
 }
 
 impl Log {
+    /// A raw-value probe line.
+    pub fn trace(&mut self, line: String) {
+        self.trace.push(line);
+    }
+
     fn push(&mut self, text: String) {
         // A message with newlines is printed as it is: one output line per text line.
         self.lines.extend(text.split('\n').map(String::from));

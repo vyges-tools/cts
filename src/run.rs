@@ -12,7 +12,7 @@ use crate::log::{refuse, Log, Res};
 use crate::options::{self, Masters, Options};
 
 /// What the design must answer for a run.
-pub trait Design: ClockDesign + BufferLibs {
+pub trait Design: ClockDesign + BufferLibs + crate::techchar::CharDesign {
     /// `block->getCoreArea()` width and height, and DBU per micron.
     fn core_size(&self) -> (i32, i32);
     fn dbu(&self) -> i32;
@@ -187,7 +187,26 @@ fn init_characterization(o: &Options, log: &mut Log, d: &dyn Design, root: &str,
     let list = buffers::trim_sort_buffer_list(o, log, d, root, sink, o.buffer_list.clone())?;
     // "Runs after the buffer list sanity checks in trimSortBufferList".
     let _delay_buffers = buffers::create_delay_buf_list(o, log, d)?;
-    buffers::characterization_buffer(log, d, &list)
+    let (char_buf, slews, loads) = buffers::characterization_buffer(log, d, &list)?;
+    // The rest of `initCharacterization`, then the patterns and the table (`TechChar::create`).
+    let wire_unit = match o.other.get("-wire_unit") {
+        None => 0,
+        Some(v) => v.trim().parse::<f64>().map_err(|_| crate::log::Stop::Refused(format!("-wire_unit {v}: not a number")))? as u32,
+    };
+    let co = crate::techchar::CharOptions { wire_unit, max_char_slew: 0.0, max_char_cap: 0.0, slew_steps: 7, cap_steps: 20, wirelength_iterations: 4, fake_lut_entries: true };
+    let w = crate::techchar::ClockWire { dbu: d.dbu(), cap: d.wire_clk_cap(), res: d.wire_clk_res() };
+    let setup = crate::techchar::init_characterization(log, d, w, &co, list.clone(), &char_buf, sink, slews.clone(), loads.clone())?;
+    let mut probe = format!("VYGTCI|{:016x}|{:016x}|{}|{}|{}|", setup.cap_per_dbu.to_bits(), setup.res_per_dbu.to_bits(), setup.unit, setup.char_buf, setup.masters.join(","));
+    probe += &setup.wirelengths.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",");
+    probe += "|";
+    probe += &setup.slews.iter().map(|x| format!("{:08x}", x.to_bits())).collect::<Vec<_>>().join(",");
+    probe += "|";
+    probe += &setup.loads.iter().map(|x| format!("{:08x}", x.to_bits())).collect::<Vec<_>>().join(",");
+    probe += &format!("|{:08x}|{:08x}", setup.slew_step.to_bits(), setup.cap_step.to_bits());
+    log.trace(probe);
+    let (lut, _) = crate::techchar::create(log, d, &setup)?;
+    crate::techchar::probe_segments(log, &lut);
+    Ok((char_buf, slews, loads))
 }
 
 /// `TechChar::initClockLayerResCap`: CTS-0104 when the clock wire's resistance or capacitance per
