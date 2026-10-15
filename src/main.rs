@@ -91,7 +91,7 @@ struct CliDesign {
     /// `set_routing_alpha` was given (not modelled for the Steiner trees).
     routing_alpha_set: bool,
     /// set_cts_config's clock buffer string or footprint (findBuffers' clock test reads it).
-    clock_buffer_pattern: bool,
+    clock_pattern: vyges_rsz::preamble::ClockPattern,
     masters: HashSet<String>,
     /// `dbNet` ids by name (the block's net order).
     net_ids: HashMap<String, u32>,
@@ -460,6 +460,103 @@ impl vyges_cts::techchar::CharDesign for CliDesign {
     }
 }
 
+impl CliDesign {
+    /// `Resizer::repairClkNets` on the written design, with the constraints as read.
+    fn repair_clk_nets_with(&mut self, s: &vyges_loom::sdc::Sdc, log: &mut Log, clk_buffers: &[String], max_wire_length: f64) -> Res<()> {
+        use vyges_rsz::env::{master_pins, no_signal_cap, placement_parasitics_at, port_caps_at, sdc_env, sim_constants};
+        use vyges_rsz::odb_design::{net_info, sdc_cap_pins, sdc_port_cap_limits, sizing_limits, CliDesign as RszDesign, TimerLog};
+        let refused = |e: String| Stop::Refused(format!("repair_clock_nets: {e}"));
+        if self.routing_alpha_set {
+            return vyges_cts::log::refuse("set_routing_alpha before repair_clock_nets' parasitics: not modelled");
+        }
+        let libs = vyges_rsz::preamble::Libs { libs: self.libs.clone(), scenes: Vec::new(), scene_libs: Vec::new(), link_scene: None };
+        let lib0 = libs.default_library().ok_or_else(|| Stop::Refused("no liberty library".into()))?;
+        if lib0.time_scale != 1e-9f32 {
+            return vyges_cts::log::refuse("a library time unit other than 1ns: not modelled");
+        }
+        let limits = vyges_rsz::timing::Limits {
+            design_max_transition: s.max_transition.map(|v| vyges_rsz::timing::user_time_to_sta(v, lib0.time_scale)),
+            design_max_fanout: s.max_fanout.map(|v| v as f32),
+            design_max_capacitance: s.max_capacitance.map(|v| vyges_rsz::timing::user_cap_to_sta(v, lib0.cap_scale)),
+            port_max_capacitance: sdc_port_cap_limits(s, lib0.cap_scale),
+        };
+        let masters = rsz_masters(&self.db)?;
+        let mut dont_use = self.set_dont_use.clone();
+        for lib in &self.libs {
+            dont_use.extend(lib.cells.values().filter(|c| c.dont_use).map(|c| c.name.clone()));
+        }
+        // `setAllClocksPropagated` ran just before: every non-virtual clock is propagated.
+        let clock_sources: Vec<String> = s.clocks.iter().filter(|c| !c.is_virtual()).flat_map(|c| c.sources.iter().cloned()).collect();
+        let clocks: Vec<Vec<String>> = s.clocks.iter().map(|c| c.sources.clone()).collect();
+        let netlist = vyges_grt::timer::netlist(&self.db);
+        let mut rc = self.rc.clone();
+        rc.sort_clk_and_signal_layers();
+        let caps = port_caps_at(None, Some(s), &libs, &netlist).map_err(refused)?;
+        let parasitics = placement_parasitics_at(&self.db, &rc, &self.liberty, &clock_sources, true, 0.3, 1, &caps).map_err(refused)?;
+        let wire_rc: Vec<vyges_rsz::buffered_net::WireRc> = (0..libs.scene_count().max(1))
+            .map(|k| {
+                let v = rc.resolved(&self.tech, k);
+                vyges_rsz::buffered_net::WireRc { h_res: v[0], v_res: v[1], h_cap: v[2], v_cap: v[3] }
+            })
+            .collect();
+        let constants = sim_constants(&self.db, &self.liberty).map_err(refused)?;
+        let mut env = sdc_env(s, &libs, &netlist).map_err(refused)?;
+        env.constants = constants.clone();
+        let mpins = master_pins(&self.db).map_err(refused)?;
+        let info = net_info(&self.db, &netlist).map_err(refused)?;
+        let estimating = !no_signal_cap(&self.db, &rc);
+        let core = self.core_area();
+        let core = (core != (0, 0, 0, 0)).then_some(core);
+        let port_caps = env.port_pin_cap.clone();
+        let block_limits = sizing_limits(&self.db).map_err(refused)?;
+        let dbu = self.db.tech_get_db_units_per_micron();
+        // dbNetwork::id(pin): an instance terminal's odb id << 1, a port's << 1 | 1 (`PinSet`'s order).
+        let ids: HashMap<String, u64> = {
+            let mut m = HashMap::new();
+            for v in &netlist.insts {
+                for p in mpins.get(&v.1).into_iter().flatten() {
+                    if let Ok(id) = self.db.iterm_id(&v.0, p) {
+                        m.insert(format!("{}/{p}", v.0), u64::from(id) << 1);
+                    }
+                }
+            }
+            for b in self.db.block_get_b_terms() {
+                if let Ok(id) = self.db.bterm_id(&b) {
+                    m.insert(b, (u64::from(id) << 1) | 1);
+                }
+            }
+            m
+        };
+        let liberty = self.liberty.clone();
+        let mut trace = vyges_rsz::trace::Trace::default();
+        let r = {
+            let mut design = RszDesign { db: &mut self.db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, constants, alpha: 0.3, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: true, journal: Vec::new(), sdc_nets: BTreeSet::new(), sdc_pins: sdc_cap_pins(s), timer: TimerLog::default(), stale_out_arcs: std::collections::BTreeMap::new(), gr: None, gr_error: None, undoing: false };
+            let inputs = vyges_rsz::repair_design::Inputs { libs: &libs, masters: &masters, dont_use: &dont_use, limits, clock_sources: &clock_sources, dbu, wire_rc, sdc: env, master_pins: mpins, sizing_limits: block_limits, clock_pattern: self.clock_pattern.clone() };
+            let order = |p: &str| ids.get(p).copied().unwrap_or(u64::MAX);
+            vyges_rsz::repair_design::repair_clk_nets(&inputs, &mut design, clk_buffers, &clocks, &order, max_wire_length, &mut trace)
+        };
+        if let Ok(path) = std::env::var("VYGES_CTS_RSZ_TRACE") {
+            let _ = std::fs::write(&path, trace.text());
+        }
+        self.refresh();
+        self.clock_arrivals = None;
+        match r {
+            Ok(outcome) => {
+                for (code, msg) in outcome.clk_summary() {
+                    let id = code.trim_start_matches("RSZ-").parse().unwrap_or(0);
+                    log.info("RSZ", id, msg);
+                }
+                Ok(())
+            }
+            Err(vyges_rsz::Stop::Refused { msg, .. }) => vyges_cts::log::refuse(format!("repair_clock_nets: {msg}")),
+            Err(vyges_rsz::Stop::Error { code, msg }) => match code.strip_prefix("RSZ-").and_then(|n| n.parse::<u32>().ok()) {
+                Some(id) => log.error("RSZ", id, msg),
+                None => vyges_cts::log::refuse(format!("repair_clock_nets: {code}: {msg}")),
+            },
+        }
+    }
+}
+
 impl Design for CliDesign {
     fn core_size(&self) -> (i32, i32) {
         (self.db.block_get_core_area_dx(), self.db.block_get_core_area_dy())
@@ -488,15 +585,18 @@ impl Design for CliDesign {
     fn sdc_clocks(&self) -> Vec<SdcClock> {
         self.clocks.clone()
     }
+    fn repair_clk_nets(&mut self, log: &mut Log, clk_buffers: &[String], max_wire_length: f64) -> Res<()> {
+        let s = self.sdc.take().ok_or_else(|| Stop::Refused("repair_clock_nets without constraints: not modelled".into()))?;
+        let r = self.repair_clk_nets_with(&s, log, clk_buffers, max_wire_length);
+        self.sdc = Some(s);
+        r
+    }
     fn find_max_wire_length(&self) -> Res<f64> {
         let v = self.rc.resolved(&self.tech, 0);
         let rc = vyges_rsz::buffered_net::WireRc { h_res: v[0], v_res: v[1], h_cap: v[2], v_cap: v[3] };
         // No scene with a signal resistance: -inf, before any buffer is looked at.
         if self.rc.resolve(&self.tech, |w| &w.signal_res).is_empty() || (rc.h_res + rc.v_res) / 2.0 <= 0.0 {
             return Ok(f64::NEG_INFINITY);
-        }
-        if self.clock_buffer_pattern {
-            return vyges_cts::log::refuse("findBuffers with a clock buffer string or footprint is not modelled");
         }
         let libs = vyges_rsz::preamble::Libs { libs: self.libs.clone(), scenes: Vec::new(), scene_libs: Vec::new(), link_scene: None };
         let masters = rsz_masters(&self.db)?;
@@ -505,7 +605,7 @@ impl Design for CliDesign {
             dont_use.extend(lib.cells.values().filter(|c| c.dont_use).map(|c| c.name.clone()));
         }
         // Clock buffers excluded: the resizer's default, which only its hold repair turns off.
-        let buffers = vyges_rsz::preamble::find_buffers(&libs, &masters, &dont_use, true).map_err(|e| Stop::Refused(format!("findBuffers: {}", e.message())))?;
+        let buffers = vyges_rsz::preamble::find_buffers_with(&libs, &masters, &dont_use, true, &self.clock_pattern).map_err(|e| Stop::Refused(format!("findBuffers: {}", e.message())))?;
         let (tgt_slews, _, _) = vyges_rsz::preamble::find_target_loads(&libs, &buffers.cells, &dont_use);
         let mut master_pins = HashMap::new();
         for m in &self.masters {
@@ -567,7 +667,7 @@ fn read_text(path: &str) -> Result<String, String> {
 }
 
 fn run(job: &Value) -> Result<Value, String> {
-    let mut d = CliDesign { db: Db::new(), libs: Vec::new(), rc: vyges_est::rc::Rc::new(), tech: String::new(), clocks: Vec::new(), dont_use: BTreeSet::new(), set_dont_use: BTreeSet::new(), routing_alpha_set: false, clock_buffer_pattern: false, masters: HashSet::new(), net_ids: HashMap::new(), bterms: HashSet::new(), sdc_max_fanout: false, design_max_fanout: None, cell_max_fanout: HashMap::new(), liberty: vyges_est::liberty::LibertyClocks::default(), sdc: None, clock_arrivals: None };
+    let mut d = CliDesign { db: Db::new(), libs: Vec::new(), rc: vyges_est::rc::Rc::new(), tech: String::new(), clocks: Vec::new(), dont_use: BTreeSet::new(), set_dont_use: BTreeSet::new(), routing_alpha_set: false, clock_pattern: Default::default(), masters: HashSet::new(), net_ids: HashMap::new(), bterms: HashSet::new(), sdc_max_fanout: false, design_max_fanout: None, cell_max_fanout: HashMap::new(), liberty: vyges_est::liberty::LibertyClocks::default(), sdc: None, clock_arrivals: None };
     let mut o = Options::default();
     let mut log = Log::default();
     let mut pre: Vec<String> = Vec::new();
@@ -658,11 +758,10 @@ fn run(job: &Value) -> Result<Value, String> {
                     }
                 }
                 "set_cts_config" => {
-                    if args.iter().any(|a| a.starts_with("-clock_buffer_")) {
-                        d.clock_buffer_pattern = true;
-                    }
                     let dd = &d;
                     vyges_cts::options::set_cts_config(&mut o, &mut log, &MastersOf(dd), &args, &mut |o, log, b| vyges_cts::buffers::set_buffer_list(o, log, dd, b))?;
+                    // The resizer's clock-buffer pattern, as set_cts_config left it.
+                    d.clock_pattern = vyges_rsz::preamble::ClockPattern::from_settings(o.clock_buffer_string.as_deref(), o.clock_buffer_footprint.as_deref());
                 }
                 "clock_tree_synthesis" => {
                     // The command's own lines only: what the steps before it printed is kept apart.

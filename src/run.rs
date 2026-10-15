@@ -33,6 +33,12 @@ pub trait Design: ClockDesign + BufferLibs + crate::techchar::CharDesign + crate
     /// `Resizer::findMaxWireLength(false)` in meters: the least over the scenes with a signal wire
     /// resistance and the resizer's buffers; `-inf` when no scene has one.
     fn find_max_wire_length(&self) -> Res<f64>;
+    /// `Resizer::repairClkNets(max_wire_length)` on the written design, every clock propagated:
+    /// long wires in each clock's network repaired with the clock buffers (`clk_buffers_`),
+    /// nothing else; its RSZ-0047 / RSZ-0048 lines into `log`. Refused where not modelled.
+    fn repair_clk_nets(&mut self, _log: &mut Log, _clk_buffers: &[String], _max_wire_length: f64) -> Res<()> {
+        refuse("-repair_clock_nets is not modelled")
+    }
     /// The non-via shapes of an instance terminal (`dbITermShapeItr`), placed: `(x0, y0, x1, y1)`.
     fn iterm_shape_boxes(&self, inst: &str, pin: &str) -> Vec<(i32, i32, i32, i32)>;
     /// `block->getCoreArea()` as `(xMin, yMin, xMax, yMax)`.
@@ -184,8 +190,12 @@ fn run_stages(o: &mut Options, log: &mut Log, d: &mut dyn Design) -> Res<Outcome
     crate::write::write_data_to_db(log, d, &mut w, &wo, &mut trees)?;
     // `setAllClocksPropagated` prints nothing: the timer the balancer asks is built on the written
     // design with every non-virtual clock propagated and the placement parasitics re-estimated.
+    // repairClockNets: `findMaxWireLength(false)`, and a repair only when it is positive.
     if o.other.get("repair_clock_nets").is_some_and(|v| v == "true") {
-        return refuse("-repair_clock_nets is not modelled");
+        let max_wire_length = d.find_max_wire_length()?;
+        if max_wire_length > 0.0 {
+            d.repair_clk_nets(log, &o.buffer_list, max_wire_length)?;
+        }
     }
     let unit = f64::from(d.dbu());
     let bo = crate::latency::BOptions { delay_buffers: &delay_buffers, cap_per_dbu: d.wire_clk_cap() * 1e-6 / unit, res_per_dbu: d.wire_clk_res() * 1e-6 / unit, wire_segment_unit: lut.length_unit as i32 };
