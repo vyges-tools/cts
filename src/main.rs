@@ -411,6 +411,8 @@ impl CliDesign {
         let mut s = self.sdc.take().ok_or("the latency balancer without constraints: not modelled")?;
         // Every non-virtual clock propagated, whatever set_propagated_clock named.
         let named = std::mem::take(&mut s.propagated);
+        // `[all_inputs]` / `[all_outputs]` delays as the ports they name (the search reads ports).
+        vyges_rsz::env::expand_io_delay_ports(&mut s, &netlist);
         let r = (|| -> Result<HashMap<String, Vec<(f32, String)>>, String> {
             let clock_sources: Vec<String> = s.clocks.iter().filter(|c| !c.is_virtual()).flat_map(|c| c.sources.iter().cloned()).collect();
             let mut rc = self.rc.clone();
@@ -983,6 +985,7 @@ fn main() -> std::process::ExitCode {
         },
     };
     let status = report["status"].as_str().unwrap_or("error").to_string();
+    emit_events(&report);
     let text = format!("{report}\n");
     match &out {
         Some(f) => {
@@ -994,6 +997,34 @@ fn main() -> std::process::ExitCode {
         None => print!("{text}"),
     }
     ExitCode::from(exit_for(&status))
+}
+
+/// The run's lines as structured events (`vyges-events/1.0`): each `[INFO|WARNING|ERROR TOOL-nnnn]
+/// text` line the reference's logger would print under its own code and severity, any other line
+/// (`report` text) as information; a refusal under `CTS-REFUSED`. The JSON report is unchanged.
+fn emit_events(report: &Value) {
+    use vyges_events::{emit, Event, Severity};
+    let lines = report["before"].as_array().into_iter().flatten().chain(report["lines"].as_array().into_iter().flatten());
+    for l in lines.filter_map(Value::as_str) {
+        let parsed = l.strip_prefix('[').and_then(|r| r.split_once("] ")).and_then(|(head, text)| head.split_once(' ').map(|(sev, code)| (sev, code, text)));
+        let ev = match parsed {
+            Some((sev, code, text)) => {
+                let severity = match sev {
+                    "ERROR" | "CRITICAL" => Severity::Error,
+                    "WARNING" => Severity::Warn,
+                    _ => Severity::Info,
+                };
+                Event::new("vyges-cts", severity, text.to_string()).with_code(code)
+            }
+            None => Event::new("vyges-cts", Severity::Info, l.to_string()),
+        };
+        emit(&ev);
+    }
+    if report["status"] == "refused" {
+        if let Some(why) = report["reason"].as_str() {
+            emit(&Event::new("vyges-cts", Severity::Warn, why.to_string()).with_code("CTS-REFUSED"));
+        }
+    }
 }
 
 #[cfg(test)]

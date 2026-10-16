@@ -429,6 +429,7 @@ version = "0.1.41"
 dependencies = [
  "serde_json",
  "vyges-est",
+ "vyges-events",
  "vyges-grt",
  "vyges-loom",
  "vyges-opendb",
@@ -458,7 +459,7 @@ dependencies = [
 [[package]]
 name = "vyges-events"
 version = "0.1.41"
-source = "git+https://github.com/vyges-tools/events?branch=main#dc62f630beaa55f7b3bc25f4cf93192c63c5786d"
+source = "git+https://github.com/vyges-tools/events.git?branch=main#dc62f630beaa55f7b3bc25f4cf93192c63c5786d"
 dependencies = [
  "serde",
  "serde_json",

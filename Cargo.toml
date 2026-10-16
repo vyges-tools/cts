@@ -10,13 +10,15 @@ repository = "https://github.com/vyges-tools/cts"
 
 [features]
 # The command-line engine: the database, the wire RC, the SDC reader, and JSON jobs.
-cli = ["dep:vyges-opendb", "dep:vyges-est", "dep:vyges-loom", "dep:vyges-rsz", "vyges-rsz/cli", "dep:vyges-grt", "dep:serde_json"]
+cli = ["dep:vyges-events", "dep:vyges-opendb", "dep:vyges-est", "dep:vyges-loom", "dep:vyges-rsz", "vyges-rsz/cli", "dep:vyges-grt", "dep:serde_json"]
 
 [dependencies]
 # The timer's library model: cells, ports, arcs.
 vyges-sta = { git = "https://github.com/vyges-tools/sta.git", branch = "main" }
 # The Steiner trees clock-gate cloning reads.
 vyges-stt = { git = "https://github.com/vyges-tools/stt.git", branch = "main" }
+# The run's lines as structured events (the CLI's events trail).
+vyges-events = { git = "https://github.com/vyges-tools/events.git", branch = "main", default-features = false, optional = true }
 vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "main", optional = true }
 vyges-est = { git = "https://github.com/vyges-tools/est.git", branch = "main", features = ["odb"], optional = true }
 vyges-loom = { git = "https://github.com/vyges-tools/loom.git", branch = "main", optional = true }
