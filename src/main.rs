@@ -726,7 +726,15 @@ fn run(job: &Value) -> Result<Value, String> {
                 }
                 "read_sdc" => {
                     let path = args.last().ok_or_else(|| Stop::Refused("read_sdc path".into()))?;
-                    let s = vyges_loom::sdc::Sdc::load(path).map_err(|e| Stop::Refused(format!("{path}: {}", e.0)))?;
+                    // Read against the linked design, as the reference does: object queries select
+                    // from the database's ports, instances and pins.
+                    let s = if d.db.inst_names().is_empty() {
+                        vyges_loom::sdc::Sdc::load(path)
+                    } else {
+                        let libs = vyges_rsz::preamble::Libs { libs: d.libs.clone(), scenes: Vec::new(), scene_libs: Vec::new(), link_scene: None };
+                        vyges_loom::sdc::Sdc::load_with(path, &vyges_rsz::env::sdc_design(&d.db, &libs))
+                    }
+                    .map_err(|e| Stop::Refused(format!("{path}: {}", e.0)))?;
                     if let Some(q) = s.unevaluated_queries.first() {
                         return vyges_cts::log::refuse(format!("{path}: {q}: object query not evaluated, not modelled"));
                     }
