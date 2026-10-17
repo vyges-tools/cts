@@ -727,6 +727,9 @@ fn run(job: &Value) -> Result<Value, String> {
                 "read_sdc" => {
                     let path = args.last().ok_or_else(|| Stop::Refused("read_sdc path".into()))?;
                     let s = vyges_loom::sdc::Sdc::load(path).map_err(|e| Stop::Refused(format!("{path}: {}", e.0)))?;
+                    if let Some(q) = s.unevaluated_queries.first() {
+                        return vyges_cts::log::refuse(format!("{path}: {q}: object query not evaluated, not modelled"));
+                    }
                     for c in ["set_disable_timing", "set_case_analysis", "create_generated_clock"] {
                         if s.ignored.iter().any(|i| i == c) {
                             return vyges_cts::log::refuse(format!("{path}: {c} (the clock network it changes) is not modelled"));
