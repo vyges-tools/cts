@@ -425,7 +425,7 @@ checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
 name = "vyges-cts"
-version = "0.1.41"
+version = "0.1.42"
 dependencies = [
  "serde_json",
  "vyges-est",
@@ -440,8 +440,8 @@ dependencies = [
 
 [[package]]
 name = "vyges-dpl"
-version = "0.1.41"
-source = "git+https://github.com/vyges-tools/dpl.git?branch=main#e2d89bbf5e5980ec89cb1ba47eda5463e3406311"
+version = "0.1.42"
+source = "git+https://github.com/vyges-tools/dpl.git?branch=main#389c0a532b2c6cc15ce0cd7a33835a118a1208db"
 dependencies = [
  "serde",
  "serde_json",
@@ -451,15 +451,15 @@ dependencies = [
 
 [[package]]
 name = "vyges-est"
-version = "0.1.41"
+version = "0.1.42"
 dependencies = [
  "vyges-opendb",
 ]
 
 [[package]]
 name = "vyges-events"
-version = "0.1.41"
-source = "git+https://github.com/vyges-tools/events.git?branch=main#dc62f630beaa55f7b3bc25f4cf93192c63c5786d"
+version = "0.1.42"
+source = "git+https://github.com/vyges-tools/events.git?branch=main#e56d57383fbc4a21c3e4f35e13abb8a750956bb7"
 dependencies = [
  "serde",
  "serde_json",
@@ -467,12 +467,12 @@ dependencies = [
 
 [[package]]
 name = "vyges-geom"
-version = "0.1.41"
-source = "git+https://github.com/vyges-tools/geom?branch=main#3127d9b8392325c766d2e79dd0f632dd37199d68"
+version = "0.1.42"
+source = "git+https://github.com/vyges-tools/geom?branch=main#79bc9c6ef94df703a56d07ab4219fa5d79d54bcb"
 
 [[package]]
 name = "vyges-grt"
-version = "0.1.41"
+version = "0.1.42"
 dependencies = [
  "vyges-est",
  "vyges-opendb",
@@ -481,7 +481,7 @@ dependencies = [
 
 [[package]]
 name = "vyges-layout"
-version = "0.1.41"
+version = "0.1.42"
 dependencies = [
  "miniz_oxide 0.8.9",
  "vyges-geom",
@@ -489,11 +489,11 @@ dependencies = [
 
 [[package]]
 name = "vyges-loom"
-version = "0.1.41"
+version = "0.1.42"
 
 [[package]]
 name = "vyges-opendb"
-version = "0.1.41"
+version = "0.1.42"
 dependencies = [
  "cxx",
  "serde",
@@ -507,7 +507,7 @@ dependencies = [
 
 [[package]]
 name = "vyges-opendb-lib"
-version = "0.1.41"
+version = "0.1.42"
 dependencies = [
  "cmake",
  "cxx",
@@ -516,7 +516,7 @@ dependencies = [
 
 [[package]]
 name = "vyges-rsz"
-version = "0.1.41"
+version = "0.1.42"
 dependencies = [
  "flate2",
  "serde_json",
@@ -532,11 +532,11 @@ dependencies = [
 
 [[package]]
 name = "vyges-sta"
-version = "0.1.41"
+version = "0.1.42"
 
 [[package]]
 name = "vyges-stt"
-version = "0.1.41"
+version = "0.1.42"
 dependencies = [
  "serde_json",
  "vyges-events",
