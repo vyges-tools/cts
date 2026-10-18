@@ -70,7 +70,7 @@ pub trait ClockDesign {
     fn iterm_avg_xy(&self, t: &ITerm) -> Option<(i32, i32)>;
     /// Every instance's `getLocation()`.
     fn inst_locations(&self) -> Vec<(i32, i32)>;
-    /// The block has a module hierarchy.
+    /// `dbNetwork::hasHierarchy`: the design was linked hierarchically (`link_design -hier`).
     fn has_hierarchy(&self) -> bool;
     /// `stt::makeSteinerTree(net, xs, ys, drvr)` with the net's routing alpha.
     fn steiner_tree(&self, net: &str, xs: &[i32], ys: &[i32], drvr: usize) -> Res<vyges_stt::Tree>;
@@ -484,9 +484,9 @@ fn find_long_edges(d: &mut dyn ClockDesign, log: &mut Log, s: &Setup, f: &mut Fo
         }
     }
     log.debug("CTS", G, 1, || format!("Found {valid} clusters"));
-    if d.has_hierarchy() {
-        return refuse("clock gate cloning in a hierarchical design (the clone's module) is not modelled");
-    }
+    // The reference finds the gater net's module (the clone's scope) here, but nothing is written
+    // until a clone is made: a hierarchical design whose gaters keep one cluster each is cloned
+    // exactly as a flat one (gated_clock4).
     let mut n_clones = 0;
     for (n, cluster) in clusters.iter().enumerate() {
         if cluster.is_empty() {
@@ -497,6 +497,9 @@ fn find_long_edges(d: &mut dyn ClockDesign, log: &mut Log, s: &Setup, f: &mut Fo
             log.debug("CTS", G, 2, || format!(" Original net {icg_net}"));
             (icg_term.0.clone(), icg_net.clone(), false)
         } else {
+            if d.has_hierarchy() {
+                return refuse("clock gate cloning in a hierarchical design (the clone's module) is not modelled");
+            }
             n_clones += 1;
             let net_name = d.make_clock_net(&format!("clonenet_{n_clones}_{icg_net}"))?;
             f.sta_clock_nets.insert(net_name.clone());

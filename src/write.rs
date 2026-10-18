@@ -27,6 +27,14 @@ pub trait TreeDb: ClockDesign {
     fn disconnect(&mut self, t: &ITerm) -> Res<()>;
     /// `dbInst::create` (top module), `TIMING`, at `(x, y)`, `PLACED`.
     fn create_placed_inst(&mut self, master: &str, name: &str, x: i32, y: i32) -> Res<()>;
+    /// As [`create_placed_inst`](Self::create_placed_inst), in `owner`'s module (`dbInst::create(..,
+    /// parent)`).
+    fn create_placed_inst_beside(&mut self, master: &str, name: &str, x: i32, y: i32, owner: &str) -> Res<()>;
+    /// `dbModNet::destroy` of the pin's hierarchical net (a port `pin` when `inst` is empty); false
+    /// when it has none.
+    fn destroy_pin_mod_net(&mut self, inst: &str, pin: &str) -> Res<bool>;
+    /// `dbNetwork::hierarchicalConnect(src, dst, name)`.
+    fn hierarchical_connect(&mut self, src: &ITerm, dst: &ITerm, name: &str) -> Res<()>;
     /// `dbNet::create` + `CLOCK`.
     fn create_clock_net(&mut self, name: &str) -> Res<()>;
     fn set_net_clock(&mut self, net: &str) -> Res<()>;
@@ -176,11 +184,25 @@ pub fn write_data_to_db(log: &mut Log, d: &mut dyn TreeDb, w: &mut Writer, o: &W
 
 /// `writeClockNetsToDb`.
 fn write_clock_nets_to_db(log: &mut Log, d: &mut dyn TreeDb, w: &mut Writer, trees: &mut [Tree], ti: usize) -> Res<()> {
-    if d.has_hierarchy() {
-        return refuse("writing clock trees into a hierarchical design (module nets) is not modelled");
-    }
     let top_net = trees[ti].net.clone();
+    // getNetDriverParentModule: the clock net's driver — an instance's output, else a port — whose
+    // instance's module the buffers are made in (the top for a port).
+    let driver = d.net_first_output(&top_net);
+    let driver_port = if driver.is_none() { d.net_bterms(&top_net).into_iter().find(|p| d.bterm_is_input(p)) } else { None };
     disconnect_all_sinks_from_net(d, &top_net)?;
+    // destroyClockModNet: the driver's module net loses its loads to the tree; only the root
+    // buffer goes back on the flat net.
+    if d.has_hierarchy() {
+        match (&driver, &driver_port) {
+            (Some(t), _) => {
+                d.destroy_pin_mod_net(&t.0, &t.1)?;
+            }
+            (None, Some(p)) => {
+                d.destroy_pin_mod_net("", p)?;
+            }
+            (None, None) => {}
+        }
+    }
     // The register tree's top buffer goes back on the net that drives it.
     if trees[ti].tree_type == TreeType::Register {
         let top = trees[ti].top_buffer_name.clone();
@@ -192,7 +214,8 @@ fn write_clock_nets_to_db(log: &mut Log, d: &mut dyn TreeDb, w: &mut Writer, tre
             d.connect(&input, &net)?;
         }
     }
-    create_clock_buffers(log, d, w, trees, ti)?;
+    let owner = driver.as_ref().filter(|_| d.has_hierarchy()).map(|t| t.0.clone());
+    create_clock_buffers(log, d, w, trees, ti, owner.as_deref())?;
     // The root buffer on the clock net.
     let clock_name = trees[ti].clock.name.clone();
     let top_inst = format!("clkbuf_0_{clock_name}");
@@ -207,7 +230,7 @@ fn write_clock_nets_to_db(log: &mut Log, d: &mut dyn TreeDb, w: &mut Writer, tre
     let mut removed: HashSet<InstRef> = HashSet::new();
     let n_subnets = trees[ti].clock.subnets.len();
     for s in 0..n_subnets {
-        let sub = trees[ti].clock.subnets[s].clone();
+        let mut sub = trees[ti].clock.subnets[s].clone();
         let mut output_found = true;
         let mut input_found = true;
         if sub.name == format!("clknet_0_{clock_name}") {
@@ -235,7 +258,24 @@ fn write_clock_nets_to_db(log: &mut Log, d: &mut dyn TreeDb, w: &mut Writer, tre
             let placed = pin.as_ref().map(|p| d.inst_is_placed(&p.0));
             input_found = still_connecting(input_found, placed);
             if input_found {
-                d.connect(pin.as_ref().expect("found"), &sub.name)?;
+                let pin = pin.as_ref().expect("found");
+                d.connect(pin, &sub.name)?;
+                // The connection resolved through the module hierarchy.
+                if d.has_hierarchy() {
+                    let Some(o) = &output else {
+                        return refuse(format!("{}: a hierarchical connection from a buffer with no output", sub.name));
+                    };
+                    d.hierarchical_connect(o, pin, &sub.name)?;
+                    // hierarchicalConnect ends in renameWithModNetInHighestHier: the flat net takes
+                    // its highest module net's name (`clknet_1_0__leaf_clk` -> `..._clk_1`). The
+                    // reference holds the dbNet, so follow the rename here.
+                    if let Some(n) = d.iterm_net(o) {
+                        if n != sub.name {
+                            sub.name = n.clone();
+                            trees[ti].clock.subnets[s].name = n;
+                        }
+                    }
+                }
             }
         }
         if sub.leaf {
@@ -332,10 +372,13 @@ fn check_upstream_connections(d: &mut dyn TreeDb, net: &str, fixed: &mut i32, cl
 }
 
 /// `createClockBuffers`: every buffer of the tree, in the order added, CTS-0018.
-fn create_clock_buffers(log: &mut Log, d: &mut dyn TreeDb, w: &mut Writer, trees: &[Tree], ti: usize) -> Res<()> {
+fn create_clock_buffers(log: &mut Log, d: &mut dyn TreeDb, w: &mut Writer, trees: &[Tree], ti: usize, owner: Option<&str>) -> Res<()> {
     let mut n = 0u32;
     for (bi, b) in trees[ti].clock.buffers.iter().enumerate() {
-        d.create_placed_inst(&b.master, &b.name, b.x, b.y)?;
+        match owner {
+            Some(o) => d.create_placed_inst_beside(&b.master, &b.name, b.x, b.y, o)?,
+            None => d.create_placed_inst(&b.master, &b.name, b.x, b.y)?,
+        }
         w.inst_to_buffer.insert(b.name.clone(), (ti, bi));
         n += 1;
     }

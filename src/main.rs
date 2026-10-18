@@ -205,7 +205,7 @@ impl ClockDesign for CliDesign {
         self.db.block_get_insts().iter().map(|i| (self.db.inst_get_location_x(i), self.db.inst_get_location_y(i))).collect()
     }
     fn has_hierarchy(&self) -> bool {
-        !self.db.block_get_mod_insts().is_empty()
+        self.db.has_hierarchy()
     }
     fn steiner_tree(&self, net: &str, xs: &[i32], ys: &[i32], drvr: usize) -> Res<vyges_stt::Tree> {
         if self.routing_alpha_set {
@@ -250,9 +250,10 @@ impl ClockDesign for CliDesign {
         self.db.inst_set_placement_status(inst, "PLACED").map_err(e)
     }
     fn fork_register_net(&mut self, net: &str, sinks: &[ITerm], root_buffer: &str, top_buffer: &str) -> Res<String> {
-        if !self.db.block_get_mod_insts().is_empty() {
-            return vyges_cts::log::refuse("the register tree's buffer in a hierarchical design (its target module) is not modelled");
-        }
+        // The reference asks each net's driver module and makes the buffer in their common one, but
+        // the new net has no driver yet, so its module is the top, and a null target is the top
+        // too: the buffer always lands in the top module, hierarchical design or not
+        // (hier_insertion_delay). The connections below are flat.
         let e = |e: vyges_opendb::Error| Stop::Refused(format!("forkRegisterClockNetwork: {e}"));
         let second = format!("{net}_regs");
         self.db.create_net(&second).map_err(e)?;
@@ -324,6 +325,19 @@ impl vyges_cts::write::TreeDb for CliDesign {
         self.db.inst_set_source_type(name, "TIMING").map_err(e)?;
         self.db.set_inst_location(name, x, y).map_err(e)?;
         self.db.inst_set_placement_status(name, "PLACED").map_err(e)
+    }
+    fn create_placed_inst_beside(&mut self, master: &str, name: &str, x: i32, y: i32, owner: &str) -> Res<()> {
+        let e = |e: vyges_opendb::Error| Stop::Refused(format!("create {name}: {e}"));
+        self.db.create_inst_beside(master, name, owner).map_err(e)?;
+        self.db.inst_set_source_type(name, "TIMING").map_err(e)?;
+        self.db.set_inst_location(name, x, y).map_err(e)?;
+        self.db.inst_set_placement_status(name, "PLACED").map_err(e)
+    }
+    fn destroy_pin_mod_net(&mut self, inst: &str, pin: &str) -> Res<bool> {
+        self.db.destroy_pin_mod_net(inst, pin).map_err(|e| Stop::Refused(format!("{inst}/{pin}: {e}")))
+    }
+    fn hierarchical_connect(&mut self, src: &ITerm, dst: &ITerm, name: &str) -> Res<()> {
+        self.db.hierarchical_connect(&src.0, &src.1, &dst.0, &dst.1, name).map_err(|e| Stop::Refused(format!("hierarchicalConnect {name}: {e}")))
     }
     fn create_clock_net(&mut self, name: &str) -> Res<()> {
         let e = |e: vyges_opendb::Error| Stop::Refused(format!("create net {name}: {e}"));
