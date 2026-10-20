@@ -441,7 +441,6 @@ dependencies = [
 [[package]]
 name = "vyges-dpl"
 version = "0.1.42"
-source = "git+https://github.com/vyges-tools/dpl.git?branch=main#389c0a532b2c6cc15ce0cd7a33835a118a1208db"
 dependencies = [
  "serde",
  "serde_json",

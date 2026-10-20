@@ -60,6 +60,9 @@ vyges-rsz = { path = "../vyges-tools-rsz" }
 [patch."https://github.com/vyges-tools/grt.git"]
 vyges-grt = { path = "../vyges-tools-grt" }
 
+[patch."https://github.com/vyges-tools/dpl.git"]
+vyges-dpl = { path = "../vyges-tools-dpl" }
+
 [patch."https://github.com/vyges-tools/loom.git"]
 vyges-loom = { path = "../vyges-tools-loom" }
 
