@@ -331,14 +331,14 @@ fn chain_netlist(s: &Setup, t: &Topology) -> (Netlist, Vec<(String, String, u32)
     // design's network) but not the timer built over that block, so every configuration is timed
     // with the characterization buffer.
     for k in 0..t.masters.len() {
-        nl.insts.push((format!("buf{k}"), s.char_buf.clone()));
+        nl.insts.push(vyges_sta::netlist::inst(format!("buf{k}"), s.char_buf.clone()));
         let to = Conn::Inst(k, s.buf_in.clone());
         let (a, b) = (nl.pin_name(&from), nl.pin_name(&to));
         let pins = match &from {
             Conn::Port(_) => vec![to.clone(), from.clone()],
             _ => vec![from.clone(), to.clone()],
         };
-        nl.nets.push(Net { name: format!("n{k}"), pins });
+        nl.nets.push(Net { name: format!("n{k}"), pins }.into());
         ends.push((a, b, t.nodes_without_buf[k]));
         from = Conn::Inst(k, s.buf_out.clone());
     }
@@ -349,7 +349,7 @@ fn chain_netlist(s: &Setup, t: &Topology) -> (Netlist, Vec<(String, String, u32)
         _ => vec![from.clone(), to.clone()],
     };
     let k = t.masters.len();
-    nl.nets.push(Net { name: format!("n{k}"), pins });
+    nl.nets.push(Net { name: format!("n{k}"), pins }.into());
     ends.push((a, b, t.nodes_without_buf[k]));
     (nl, ends)
 }
