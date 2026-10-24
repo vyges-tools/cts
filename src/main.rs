@@ -685,13 +685,13 @@ fn read_text(path: &str) -> Result<String, String> {
 fn run(job: &Value) -> Result<Value, String> {
     let mut d = CliDesign { db: Db::new(), libs: Vec::new(), rc: vyges_est::rc::Rc::new(), tech: String::new(), clocks: Vec::new(), dont_use: BTreeSet::new(), set_dont_use: BTreeSet::new(), routing_alpha_set: false, clock_pattern: Default::default(), masters: HashSet::new(), net_ids: HashMap::new(), bterms: HashSet::new(), sdc_max_fanout: false, design_max_fanout: None, cell_max_fanout: HashMap::new(), liberty: vyges_est::liberty::LibertyClocks::default(), sdc: None, clock_arrivals: None };
     let mut o = Options::default();
-    let mut log = Log::default();
+    let mut log = Log::with_events("vyges-cts");
     let mut pre: Vec<String> = Vec::new();
     let units = |l: &vyges_est::liberty::LibertyClocks| -> Result<vyges_est::rc::Units, String> {
         let u = l.units.ok_or("RC before a liberty library: the timer's default units are not modelled")?;
         Ok(vyges_est::rc::Units { resistance: u.resistance, capacitance: u.capacitance, distance: u.distance })
     };
-    let finish = |log: Log, pre: &[String], status: &str, reason: Option<String>| json!({"tool": "vyges-cts", "status": status, "reason": reason, "before": pre, "lines": log.lines, "trace": log.trace});
+    let finish = |log: Log, pre: &[String], status: &str, reason: Option<String>| json!({"tool": "vyges-cts", "status": status, "reason": reason, "before": pre, "lines": log.lines(), "trace": log.trace});
     for step in job["steps"].as_array().ok_or("steps")? {
         let cmd = step["cmd"].as_str().ok_or("cmd")?;
         let args: Vec<String> = step["args"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
@@ -736,7 +736,7 @@ fn run(job: &Value) -> Result<Value, String> {
                 "set_debug_level" => {
                     let [tool, group, level] = args.as_slice() else { return vyges_cts::log::refuse("set_debug_level: needs a tool, a group and a level") };
                     let level: i32 = level.parse().map_err(|_| Stop::Refused(format!("set_debug_level {level}: not an integer")))?;
-                    log.debug.insert((tool.clone(), group.clone()), level);
+                    log.set_debug_level(tool, group, level);
                 }
                 "read_sdc" => {
                     let path = args.last().ok_or_else(|| Stop::Refused("read_sdc path".into()))?;
@@ -792,7 +792,7 @@ fn run(job: &Value) -> Result<Value, String> {
                 }
                 "clock_tree_synthesis" => {
                     // The command's own lines only: what the steps before it printed is kept apart.
-                    pre.append(&mut log.lines);
+                    pre.extend(log.take_lines());
                     return vyges_cts::run::clock_tree_synthesis(&mut o, &mut log, &mut d, &args).map(Some);
                 }
                 other => return vyges_cts::log::refuse(format!("{other}: not a modelled step")),
@@ -1010,7 +1010,7 @@ fn main() -> std::process::ExitCode {
         },
     };
     let status = report["status"].as_str().unwrap_or("error").to_string();
-    emit_events(&report);
+    emit_refusal(&report);
     let text = format!("{report}\n");
     match &out {
         Some(f) => {
@@ -1024,27 +1024,10 @@ fn main() -> std::process::ExitCode {
     ExitCode::from(exit_for(&status))
 }
 
-/// The run's lines as structured events (`vyges-events/1.0`): each `[INFO|WARNING|ERROR TOOL-nnnn]
-/// text` line the reference's logger would print under its own code and severity, any other line
-/// (`report` text) as information; a refusal under `CTS-REFUSED`. The JSON report is unchanged.
-fn emit_events(report: &Value) {
+/// A refusal as an event (`vyges-events/1.0`) under `CTS-REFUSED`; the run's lines were emitted
+/// as they printed. The JSON report is unchanged.
+fn emit_refusal(report: &Value) {
     use vyges_events::{emit, Event, Severity};
-    let lines = report["before"].as_array().into_iter().flatten().chain(report["lines"].as_array().into_iter().flatten());
-    for l in lines.filter_map(Value::as_str) {
-        let parsed = l.strip_prefix('[').and_then(|r| r.split_once("] ")).and_then(|(head, text)| head.split_once(' ').map(|(sev, code)| (sev, code, text)));
-        let ev = match parsed {
-            Some((sev, code, text)) => {
-                let severity = match sev {
-                    "ERROR" | "CRITICAL" => Severity::Error,
-                    "WARNING" => Severity::Warn,
-                    _ => Severity::Info,
-                };
-                Event::new("vyges-cts", severity, text.to_string()).with_code(code)
-            }
-            None => Event::new("vyges-cts", Severity::Info, l.to_string()),
-        };
-        emit(&ev);
-    }
     if report["status"] == "refused" {
         if let Some(why) = report["reason"].as_str() {
             emit(&Event::new("vyges-cts", Severity::Warn, why.to_string()).with_code("CTS-REFUSED"));

@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The run's output, line by line as the reference's logger writes it, and how a run stops.
 
-use std::collections::BTreeMap;
+use vyges_events::logger::Logger;
 
-/// The lines a run printed and the debug levels in force.
+/// The run's message lines, written by the suite's logger (`vyges_events::logger::Logger`): the
+/// reference's line format, its per-code print limit and its debug levels.
 #[derive(Debug, Default)]
 pub struct Log {
-    pub lines: Vec<String>,
-    /// `set_debug_level <tool> <group> <level>`.
-    pub debug: BTreeMap<(String, String), i32>,
+    logger: Logger,
     /// Raw-value probe lines (`VYG…`), compared with an instrumented reference's; never output.
     pub trace: Vec<String>,
 }
@@ -29,46 +28,62 @@ pub fn refuse<T>(why: impl Into<String>) -> Res<T> {
 }
 
 impl Log {
-    /// A raw-value probe line.
-    pub fn trace(&mut self, line: String) {
-        self.trace.push(line);
+    /// A log whose lines are also emitted as events under `tool`.
+    pub fn with_events(tool: &str) -> Self {
+        Log { logger: Logger::new().events(tool), trace: Vec::new() }
     }
 
-    fn push(&mut self, text: String) {
-        // A message with newlines is printed as it is: one output line per text line.
-        self.lines.extend(text.split('\n').map(String::from));
+    /// The lines printed so far.
+    pub fn lines(&self) -> &[String] {
+        self.logger.lines()
+    }
+
+    /// The lines printed so far; the log keeps its counts and debug levels.
+    pub fn take_lines(&mut self) -> Vec<String> {
+        self.logger.take_lines()
     }
 
     pub fn info(&mut self, tool: &str, id: u32, msg: impl AsRef<str>) {
-        self.push(format!("[INFO {tool}-{id:04}] {}", msg.as_ref()));
+        self.logger.info(tool, id16(id), msg);
     }
 
     pub fn warn(&mut self, tool: &str, id: u32, msg: impl AsRef<str>) {
-        self.push(format!("[WARNING {tool}-{id:04}] {}", msg.as_ref()));
+        self.logger.warn(tool, id16(id), msg);
     }
 
     /// `logger_->error`: the line, then the run stops.
     pub fn error<T>(&mut self, tool: &'static str, id: u32, msg: impl AsRef<str>) -> Res<T> {
-        self.push(format!("[ERROR {tool}-{id:04}] {}", msg.as_ref()));
+        let Err(_) = self.logger.error::<()>(tool, id16(id), msg) else { unreachable!("an error stops") };
         Err(Stop::Error { tool, id })
     }
 
     /// `logger_->report`: the text alone.
     pub fn report(&mut self, msg: impl AsRef<str>) {
-        self.push(msg.as_ref().to_string());
+        self.logger.report(msg);
+    }
+
+    /// A raw-value probe line.
+    pub fn trace(&mut self, line: String) {
+        self.trace.push(line);
+    }
+
+    /// `set_debug_level <tool> <group> <level>`.
+    pub fn set_debug_level(&mut self, tool: &str, group: &str, level: i32) {
+        self.logger.set_debug_level(tool, group, level);
     }
 
     /// `debugPrint`'s check: the group's level is at least `level`.
     pub fn debug_on(&self, tool: &str, group: &str, level: i32) -> bool {
-        self.debug.get(&(tool.to_string(), group.to_string())).is_some_and(|&l| l >= level)
+        self.logger.debug_on(tool, group, level)
     }
 
     pub fn debug(&mut self, tool: &str, group: &str, level: i32, msg: impl FnOnce() -> String) {
-        if self.debug_on(tool, group, level) {
-            let m = msg();
-            self.push(format!("[DEBUG {tool}-{group}] {m}"));
-        }
+        self.logger.debug(tool, group, level, msg);
     }
+}
+
+fn id16(id: u32) -> u16 {
+    u16::try_from(id).expect("a message id fits four digits")
 }
 
 /// `fmt`'s `{}` for a float, from the value's own shortest digits (`fixed`: `{}`, `sci`: `{:e}`):
@@ -130,7 +145,7 @@ mod tests {
     fn lines_split_and_errors_stop() {
         let mut l = Log::default();
         l.warn("CTS", 104, "a\nb");
-        assert_eq!(l.lines, ["[WARNING CTS-0104] a", "b"]);
+        assert_eq!(l.lines(), ["[WARNING CTS-0104] a", "b"]);
         let r: Res<()> = l.error("CTS", 73, "x");
         assert_eq!(r, Err(Stop::Error { tool: "CTS", id: 73 }));
     }
