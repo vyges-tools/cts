@@ -665,7 +665,7 @@ mod tests {
     #[test]
     fn a_gater_passes_the_clock_at_its_clock_gate_pin_only() {
         use vyges_sta::liberty::{Cell, Direction, Port, Seq};
-        let port = |name: &str, dir: Direction, gate: bool| Port { name: name.into(), direction: dir, is_clock: false, capacitance: [[0.0; 2]; 2], function: None, max_transition: None, max_capacitance: None, fanout_load: None, max_fanout: None, three_state: None, is_clock_gate_clock: gate };
+        let port = |name: &str, dir: Direction, gate: bool| Port { name: name.into(), direction: dir, is_clock_gate_clock: gate, ..Port::default() };
         let mut icg = Cell { name: "ICG".into(), ..Cell::default() };
         icg.ports = vec![port("CLK", Direction::Input, true), port("GATE", Direction::Input, false), port("GCLK", Direction::Output, false)];
         icg.seqs = vec![Seq { is_register: false, clock: Some("CLK".into()), data: Some("GATE".into()), clear: None, preset: None, clear_preset_var1: Default::default(), clear_preset_var2: Default::default(), output: Some("IQ".into()), output_inv: None }];
