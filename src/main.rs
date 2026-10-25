@@ -950,7 +950,7 @@ fn exit_for(status: &str) -> u8 {
     }
 }
 
-fn main() -> std::process::ExitCode {
+pub fn main() -> std::process::ExitCode {
     use std::process::ExitCode;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut out: Option<String> = None;

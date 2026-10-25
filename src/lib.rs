@@ -10,6 +10,10 @@
 //! - [`discovery`]: the clock nets and their sinks.
 //! - [`log`]: the output lines and how a run stops.
 
+// The crate's own name inside it: the command-line entry ([`cli_main`]) is built into the
+// library too, and its `vyges_cts::…` paths resolve here.
+extern crate self as vyges_cts;
+
 pub mod buffers;
 pub mod clustering;
 pub mod discovery;
@@ -22,3 +26,10 @@ pub mod run;
 pub mod sink_clustering;
 pub mod techchar;
 pub mod write;
+
+/// The `vyges-cts` command-line entry (the binary's `main`), built into the library too so a
+/// suite binary can link every engine and run the one it is invoked as.
+#[cfg(feature = "suite")]
+#[doc(hidden)]
+#[path = "main.rs"]
+pub mod cli_main;
