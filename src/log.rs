@@ -28,9 +28,10 @@ pub fn refuse<T>(why: impl Into<String>) -> Res<T> {
 }
 
 impl Log {
-    /// A log whose lines are also emitted as events under `tool`.
+    /// A log whose lines are also printed to stderr as they are written (the run's report keeps them
+    /// too) and emitted as events under `tool`.
     pub fn with_events(tool: &str) -> Self {
-        Log { logger: Logger::new().events(tool), trace: Vec::new() }
+        Log { logger: Logger::new().events(tool).stderr(true), trace: Vec::new() }
     }
 
     /// The lines printed so far.
