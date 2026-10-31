@@ -919,7 +919,7 @@ const DESCRIBE: &str = r#"{
     "type": "object",
     "required": ["job"],
     "properties": {
-      "job": { "type": "string", "description": "path to a JSON job: {steps: [{cmd, args}]}" },
+      "job": { "type": ["string", "object"], "description": "the JSON job {steps: [{cmd, args}]}: a path to the file, or the job object itself (the server writes it to a content-addressed file)" },
       "out": { "type": "string", "description": "write the JSON report to FILE instead of stdout" }
     }
   },
@@ -1067,5 +1067,43 @@ mod tests {
         assert_eq!(exit_for("refused"), 3);
         assert_eq!(exit_for("vacuous"), 2);
         assert_eq!(exit_for("error"), 2);
+    }
+}
+
+#[cfg(test)]
+mod descriptor_args_tests {
+    use super::DESCRIBE;
+    /// Every advertised input reaches the command line, and every command-line token is
+    /// advertised -- for the main operation and each `tools[]` entry. `vyges mcp` builds the
+    /// argv from these and refuses an argument the template would drop; 0.1.51 shipped inputs
+    /// that never arrived (ifp's die area, ppl's layers, fin's rules).
+    #[test]
+    fn every_advertised_input_reaches_the_command_line() {
+        use std::collections::BTreeSet;
+        let d: serde_json::Value = serde_json::from_str(DESCRIBE).expect("descriptor is valid JSON");
+        let mut ops = vec![d.clone()];
+        ops.extend(d["tools"].as_array().cloned().unwrap_or_default());
+        for op in &ops {
+            let inv = &op["invocation"];
+            let mut used: BTreeSet<String> = inv["args_template"]
+                .as_array()
+                .expect("an args_template")
+                .iter()
+                .filter_map(|t| t.as_str())
+                .filter(|t| t.starts_with('{') && t.ends_with('}'))
+                .map(|t| t[1..t.len() - 1].to_string())
+                .collect();
+            if let Some(o) = inv.get("optional") {
+                let o = o.as_array().expect("invocation.optional is an array of {arg, flag}");
+                used.extend(o.iter().map(|x| x["arg"].as_str().expect("an arg").to_string()));
+            }
+            let props: BTreeSet<String> = op["inputs"]["properties"]
+                .as_object()
+                .expect("inputs.properties")
+                .keys()
+                .cloned()
+                .collect();
+            assert_eq!(used, props, "{}: command line vs advertised inputs", op["name"]);
+        }
     }
 }
