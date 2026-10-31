@@ -1,6 +1,6 @@
 [package]
 name = "vyges-cts"
-version = "0.1.51"
+version = "0.1.52"
 edition = "2021"
 description = "Clock tree synthesis of placed designs: the clock buffers chosen, each clock net found and its sinks collected, then an H-tree built and buffered per net."
 license = "Apache-2.0"
