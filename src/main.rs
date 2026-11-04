@@ -85,6 +85,10 @@ struct CliDesign {
     rc: vyges_est::rc::Rc,
     tech: String,
     clocks: Vec<SdcClock>,
+    /// `set_mode`: each mode's name and its SDC clocks, in creation order (the timer's `modes()`);
+    /// empty when the script never sets a mode. `cur_mode` indexes the command mode.
+    modes: Vec<(String, Vec<SdcClock>)>,
+    cur_mode: Option<usize>,
     dont_use: BTreeSet<String>,
     /// `set_dont_use` alone (the resizer adds the liberty's own).
     set_dont_use: BTreeSet<String>,
@@ -601,6 +605,13 @@ impl Design for CliDesign {
     fn sdc_clocks(&self) -> Vec<SdcClock> {
         self.clocks.clone()
     }
+    fn sdc_modes(&self) -> Vec<Vec<SdcClock>> {
+        if self.modes.is_empty() {
+            vec![self.clocks.clone()]
+        } else {
+            self.modes.iter().map(|(_, c)| c.clone()).collect()
+        }
+    }
     fn repair_clk_nets(&mut self, log: &mut Log, clk_buffers: &[String], max_wire_length: f64) -> Res<()> {
         let s = self.sdc.take().ok_or_else(|| Stop::Refused("repair_clock_nets without constraints: not modelled".into()))?;
         let r = self.repair_clk_nets_with(&s, log, clk_buffers, max_wire_length);
@@ -683,7 +694,7 @@ fn read_text(path: &str) -> Result<String, String> {
 }
 
 fn run(job: &Value) -> Result<Value, String> {
-    let mut d = CliDesign { db: Db::new(), libs: Vec::new(), rc: vyges_est::rc::Rc::new(), tech: String::new(), clocks: Vec::new(), dont_use: BTreeSet::new(), set_dont_use: BTreeSet::new(), routing_alpha_set: false, clock_pattern: Default::default(), masters: HashSet::new(), net_ids: HashMap::new(), bterms: HashSet::new(), sdc_max_fanout: false, design_max_fanout: None, cell_max_fanout: HashMap::new(), liberty: vyges_est::liberty::LibertyClocks::default(), sdc: None, clock_arrivals: None };
+    let mut d = CliDesign { db: Db::new(), libs: Vec::new(), rc: vyges_est::rc::Rc::new(), tech: String::new(), clocks: Vec::new(), modes: Vec::new(), cur_mode: None, dont_use: BTreeSet::new(), set_dont_use: BTreeSet::new(), routing_alpha_set: false, clock_pattern: Default::default(), masters: HashSet::new(), net_ids: HashMap::new(), bterms: HashSet::new(), sdc_max_fanout: false, design_max_fanout: None, cell_max_fanout: HashMap::new(), liberty: vyges_est::liberty::LibertyClocks::default(), sdc: None, clock_arrivals: None };
     let mut o = Options::default();
     let mut log = Log::with_events("vyges-cts");
     let mut pre: Vec<String> = Vec::new();
@@ -769,7 +780,23 @@ fn run(job: &Value) -> Result<Value, String> {
                             leaf_pins: c.sources.iter().filter(|x| !x.is_empty()).map(|x| if d.bterms.contains(x) { Pin::Port(x.clone()) } else { Pin::Term(split_iterm(x)) }).collect(),
                         })
                         .collect();
+                    if let Some(i) = d.cur_mode {
+                        d.modes[i].1 = d.clocks.clone();
+                    }
                     d.sdc = Some(s);
+                }
+                // `set_mode name`: later SDC is that mode's; a new name makes a mode, appended
+                // (the timer keeps modes in creation order and drops the default mode).
+                "set_mode" => {
+                    let [name] = args.as_slice() else { return vyges_cts::log::refuse("set_mode: needs one mode name") };
+                    let i = match d.modes.iter().position(|(n, _)| n == name) {
+                        Some(i) => i,
+                        None => {
+                            d.modes.push((name.clone(), Vec::new()));
+                            d.modes.len() - 1
+                        }
+                    };
+                    d.cur_mode = Some(i);
                 }
                 "set_routing_alpha" => d.routing_alpha_set = true,
                 "set_max_fanout" => {
@@ -861,7 +888,7 @@ USAGE:
 JOB FIELDS:
   steps        required — the commands in order, each {\"cmd\": ..., \"args\": [...]}, as a flow
                script passes them: read_db, read_liberty, set_wire_rc, set_layer_rc,
-               set_dont_use, set_debug_level, read_sdc, set_cts_config, set_max_fanout,
+               set_dont_use, set_debug_level, set_mode, read_sdc, set_cts_config, set_max_fanout,
                then clock_tree_synthesis [options]
   write_def    optional — where to write the design as DEF when the command is done
   write_db     optional — where to write the design as a database when the command is done

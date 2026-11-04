@@ -277,27 +277,74 @@ fn get_single_output(d: &dyn ClockDesign, f: &Found, t: &ITerm) -> Option<ITerm>
     d.inst_iterms(&t.0).into_iter().find(|o| o != t && d.iterm_is_output_signal(o, true) && d.iterm_net(o).is_some_and(|n| f.sta_clock_nets.contains(&n)))
 }
 
-/// `populateTritonCTS`. `clocks` are the SDC's, in its order.
-pub fn populate_triton_cts(d: &mut dyn ClockDesign, log: &mut Log, s: &Setup, clocks: &[SdcClock]) -> Res<Found> {
+/// The per-mode root merge of `populateTritonCTS` (upstream `cdc53fefb04`): roots seen in the
+/// current mode (an overlap there is CTS-0114) and roots any earlier clock of any mode added.
+#[derive(Default)]
+struct ModeRoots {
+    all: HashSet<String>,
+    mode: HashSet<String>,
+}
+
+impl ModeRoots {
+    /// A new mode: overlaps are checked against its own clocks only.
+    fn next_mode(&mut self) {
+        self.mode.clear();
+    }
+
+    /// One clock's roots. `Err` = a root another clock of THIS mode has (CTS-0114); `Ok(None)` =
+    /// every root was added already (the clock adds nothing); else the roots not yet added. A root
+    /// not found (`None`) never overlaps and is never already added.
+    fn add(&mut self, nets: &[Option<String>]) -> Result<Option<Vec<Option<String>>>, ()> {
+        if nets.iter().flatten().any(|n| self.mode.contains(n)) {
+            return Err(());
+        }
+        self.mode.extend(nets.iter().flatten().cloned());
+        let new_nets: Vec<Option<String>> = nets.iter().filter(|n| !n.as_ref().is_some_and(|n| self.all.contains(n))).cloned().collect();
+        if new_nets.is_empty() {
+            return Ok(None);
+        }
+        self.all.extend(new_nets.iter().flatten().cloned());
+        Ok(Some(new_nets))
+    }
+}
+
+/// `populateTritonCTS`. `modes` are the timer's modes in `modes()` order, each with its SDC's clocks
+/// in their order; a design with no `set_mode` is one mode.
+///
+/// Upstream `cdc53fefb04` (in at 4155ac3): the clock network is the union of every mode's
+/// `findClkNets(mode)`; clocks are visited mode by mode; CTS-0114 ("overlaps a previous clock") is
+/// an error only for an overlap WITHIN one mode, since modes share clock roots; a clock adds only
+/// the roots no earlier clock (of any mode) added, under its own name, and a clock whose roots were
+/// all added already adds nothing (a root shared by two modes is built once, for the first).
+pub fn populate_triton_cts(d: &mut dyn ClockDesign, log: &mut Log, s: &Setup, modes: &[Vec<SdcClock>]) -> Res<Found> {
     let mut f = Found::default();
     let mut info: Vec<(Vec<Option<String>>, String)> = Vec::new();
+    // `isLeafPinClock` asks every mode: a pin is a clock leaf when any mode's SDC makes it one.
+    let clocks: Vec<SdcClock> = modes.iter().flatten().cloned().collect();
+    let clocks = clocks.as_slice();
     if !s.clock_nets.is_empty() {
         let mut nets: Vec<String> = s.clock_nets.to_vec();
         nets.sort_by_key(|n| d.net_id(n));
         nets.dedup();
         info.push((nets.into_iter().map(Some).collect(), String::new()));
     } else {
-        f.sta_clock_nets = find_clk_nets(d, clocks);
-        let mut all: HashSet<String> = HashSet::new();
-        for clk in clocks {
-            let nets = find_clock_roots(d, log, s, clk);
-            for n in nets.iter().flatten() {
-                if all.contains(n) {
-                    return log.error("CTS", 114, format!("Clock {} overlaps a previous clock.", clk.name));
+        f.sta_clock_nets = HashSet::new();
+        for mode in modes {
+            f.sta_clock_nets.extend(find_clk_nets(d, mode));
+        }
+        // A root net not found (`None`, warned as CTS-0040 when built) is never an overlap and is
+        // never "already added", as before this change.
+        let mut merge = ModeRoots::default();
+        for mode in modes {
+            merge.next_mode();
+            for clk in mode {
+                let nets = find_clock_roots(d, log, s, clk);
+                match merge.add(&nets) {
+                    Err(()) => return log.error("CTS", 114, format!("Clock {} overlaps a previous clock.", clk.name)),
+                    Ok(None) => {}
+                    Ok(Some(new_nets)) => info.push((new_nets, clk.name.clone())),
                 }
             }
-            all.extend(nets.iter().flatten().cloned());
-            info.push((nets, clk.name.clone()));
         }
     }
     // Every instance's location, so a clone never lands on one (mapLocationToSink_ keys).
@@ -658,4 +705,52 @@ fn add_clock_sinks(log: &mut Log, f: &mut Found, net: &str, input_net: &str, clk
     log.info("CTS", 11, format!(" Clock net \"{net}\" for {kind} has {} sinks.", sinks.len()));
     f.builders.push(Builder { net: net.into(), input_net: input_net.into(), sdc_clock: clk.into(), sinks, parent, tree_type: None, top_buffer: None });
     f.builders.len() - 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ModeRoots;
+
+    fn n(v: &[&str]) -> Vec<Option<String>> {
+        v.iter().map(|s| Some(s.to_string())).collect()
+    }
+
+    /// Upstream `cdc53fefb04`: modes share clock roots, so the same root in two modes is not an
+    /// overlap; it is built once, for the first mode's clock, and the later clock adds nothing.
+    #[test]
+    fn a_root_shared_across_modes_is_built_once() {
+        let mut m = ModeRoots::default();
+        m.next_mode();
+        assert_eq!(m.add(&n(&["clk"])), Ok(Some(n(&["clk"]))));
+        m.next_mode();
+        assert_eq!(m.add(&n(&["clk"])), Ok(None));
+    }
+
+    /// Upstream: CTS-0114 is an overlap WITHIN one mode, as before multi-mode.
+    #[test]
+    fn an_overlap_within_one_mode_is_cts_0114() {
+        let mut m = ModeRoots::default();
+        m.next_mode();
+        assert_eq!(m.add(&n(&["a", "b"])), Ok(Some(n(&["a", "b"]))));
+        assert_eq!(m.add(&n(&["b"])), Err(()));
+    }
+
+    /// Upstream: a later mode's clock adds only the roots no earlier clock added, in its order.
+    #[test]
+    fn a_later_mode_adds_only_new_roots() {
+        let mut m = ModeRoots::default();
+        m.next_mode();
+        assert_eq!(m.add(&n(&["a"])), Ok(Some(n(&["a"]))));
+        m.next_mode();
+        assert_eq!(m.add(&n(&["c", "a", "d"])), Ok(Some(n(&["c", "d"]))));
+    }
+
+    /// A root not found is never an overlap and always passes through (CTS-0040 when built).
+    #[test]
+    fn an_unfound_root_passes_through() {
+        let mut m = ModeRoots::default();
+        m.next_mode();
+        assert_eq!(m.add(&[None]), Ok(Some(vec![None])));
+        assert_eq!(m.add(&[None]), Ok(Some(vec![None])));
+    }
 }

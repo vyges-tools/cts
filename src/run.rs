@@ -30,6 +30,11 @@ pub trait Design: ClockDesign + BufferLibs + crate::techchar::CharDesign + crate
     fn find_net(&self, name: &str) -> Option<String>;
     /// The SDC clocks, in the SDC's order.
     fn sdc_clocks(&self) -> Vec<SdcClock>;
+    /// Every mode's SDC clocks, modes in the timer's `modes()` order (creation order); a design
+    /// with no `set_mode` is the one mode of [`Design::sdc_clocks`].
+    fn sdc_modes(&self) -> Vec<Vec<SdcClock>> {
+        vec![self.sdc_clocks()]
+    }
     /// `Resizer::findMaxWireLength(false)` in meters: the least over the scenes with a signal wire
     /// resistance and the resizer's buffers; `-inf` when no scene has one.
     fn find_max_wire_length(&self) -> Res<f64>;
@@ -465,8 +470,8 @@ fn find_clock_roots(o: &Options, log: &mut Log) {
 /// `populateTritonCTS`.
 fn populate_triton_cts(o: &Options, log: &mut Log, d: &mut dyn Design, root: &str) -> Res<Found> {
     let setup = Setup { clock_nets: &o.clock_nets, skip_nets: &o.skip_nets, insertion_delay: o.insertion_delay, buffer_list: &o.buffer_list, root_buffer: root, max_wl: o.max_wl.clone() };
-    let clocks = d.sdc_clocks();
-    discovery::populate_triton_cts(d, log, &setup, &clocks)
+    let modes = d.sdc_modes();
+    discovery::populate_triton_cts(d, log, &setup, &modes)
 }
 
 /// The refusal for a run that reaches what is not modelled yet.
