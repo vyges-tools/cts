@@ -79,6 +79,22 @@ fn some(s: String) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
+/// One mode's `Sdc` fanout limits.
+#[derive(Clone, Debug, Default)]
+struct FanoutLimits {
+    /// `set_max_fanout V [current_design]` (`Sdc::fanoutLimit(top cell)`).
+    design: Option<f32>,
+    /// `set_max_fanout` on a cell (`Sdc::setFanoutLimit(Cell*)`): the last value given.
+    cells: HashMap<String, f32>,
+}
+
+/// `getBufferFanoutLimit`'s per-mode step, the pin's rule (upstream 1202091e44, unchanged
+/// 4155ac31..a6e7f507): the tightest limit any mode states; before the pin only the command
+/// mode's was read. `None` when no mode states one.
+fn tightest_across_modes(limits: impl Iterator<Item = Option<f32>>) -> Option<i32> {
+    limits.flatten().map(|f| f as i32).min()
+}
+
 struct CliDesign {
     db: Db,
     libs: Vec<Library>,
@@ -102,10 +118,10 @@ struct CliDesign {
     bterms: HashSet<String>,
     /// The SDC has `set_max_fanout` on something other than the design (not modelled).
     sdc_max_fanout: bool,
-    /// `set_max_fanout V [current_design]` (`Sdc::fanoutLimit(top cell)`).
-    design_max_fanout: Option<f32>,
-    /// `set_max_fanout` on a cell (`Sdc::setFanoutLimit(Cell*)`): the last value given.
-    cell_max_fanout: HashMap<String, f32>,
+    /// The fanout limits of the default mode (the SDC read before any `set_mode`).
+    default_fanout: FanoutLimits,
+    /// Each mode's fanout limits, parallel to `modes`.
+    mode_fanout: Vec<FanoutLimits>,
     /// The liberty clock data the estimator and the constant propagation read.
     liberty: vyges_est::liberty::LibertyClocks,
     /// The constraints as read.
@@ -660,9 +676,10 @@ impl Design for CliDesign {
             return vyges_cts::log::refuse("set_max_fanout on a port or pin (the SDC fanout limits) is not modelled");
         }
         let mut fanout = i32::MAX;
-        // The design's own limit first; without an output port it is the only one read.
-        if let Some(f) = self.design_max_fanout {
-            fanout = fanout.min(f as i32);
+        // The design's own limit first, the tightest across the modes; without an output port it
+        // is the only one read.
+        if let Some(f) = tightest_across_modes(self.active_fanout_limits().map(|l| l.design)) {
+            fanout = fanout.min(f);
         }
         // The first output terminal that is not a supply.
         let out = self.db.master_get_m_terms(buffer).into_iter().find(|t| {
@@ -670,9 +687,9 @@ impl Design for CliDesign {
             sig != "POWER" && sig != "GROUND" && self.db.mterm_get_io_type(buffer, t) == "OUTPUT"
         });
         // Without an output port only the design's limit is read.
-        let Some(out) = out else { return Ok(self.design_max_fanout.map_or(0, |_| fanout)) };
-        if let Some(&f) = self.cell_max_fanout.get(buffer) {
-            fanout = fanout.min(f as i32);
+        let Some(out) = out else { return Ok(if fanout == i32::MAX { 0 } else { fanout }) };
+        if let Some(f) = tightest_across_modes(self.active_fanout_limits().map(|l| l.cells.get(buffer).copied())) {
+            fanout = fanout.min(f);
         }
         let Some((lib, cell)) = self.libs.iter().find_map(|l| l.cells.get(buffer).map(|c| (l, c))) else {
             return vyges_cts::log::refuse(format!("{buffer}: no liberty cell"));
@@ -689,12 +706,29 @@ impl Design for CliDesign {
     }
 }
 
+impl CliDesign {
+    /// The command mode's limits (`cmdMode()->sdc()`), which `read_sdc` and `set_max_fanout` set.
+    fn fanout_limits_mut(&mut self) -> &mut FanoutLimits {
+        match self.cur_mode {
+            Some(i) => &mut self.mode_fanout[i],
+            None => &mut self.default_fanout,
+        }
+    }
+
+    /// The modes `openSta_->modes()` holds: the default one until a mode is made, then the made
+    /// ones (as `sdc_modes` reads them).
+    fn active_fanout_limits(&self) -> impl Iterator<Item = &FanoutLimits> {
+        let all: Vec<&FanoutLimits> = if self.mode_fanout.is_empty() { vec![&self.default_fanout] } else { self.mode_fanout.iter().collect() };
+        all.into_iter()
+    }
+}
+
 fn read_text(path: &str) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))
 }
 
 fn run(job: &Value) -> Result<Value, String> {
-    let mut d = CliDesign { db: Db::new(), libs: Vec::new(), rc: vyges_est::rc::Rc::new(), tech: String::new(), clocks: Vec::new(), modes: Vec::new(), cur_mode: None, dont_use: BTreeSet::new(), set_dont_use: BTreeSet::new(), routing_alpha_set: false, clock_pattern: Default::default(), masters: HashSet::new(), net_ids: HashMap::new(), bterms: HashSet::new(), sdc_max_fanout: false, design_max_fanout: None, cell_max_fanout: HashMap::new(), liberty: vyges_est::liberty::LibertyClocks::default(), sdc: None, clock_arrivals: None };
+    let mut d = CliDesign { db: Db::new(), libs: Vec::new(), rc: vyges_est::rc::Rc::new(), tech: String::new(), clocks: Vec::new(), modes: Vec::new(), cur_mode: None, dont_use: BTreeSet::new(), set_dont_use: BTreeSet::new(), routing_alpha_set: false, clock_pattern: Default::default(), masters: HashSet::new(), net_ids: HashMap::new(), bterms: HashSet::new(), sdc_max_fanout: false, default_fanout: FanoutLimits::default(), mode_fanout: Vec::new(), liberty: vyges_est::liberty::LibertyClocks::default(), sdc: None, clock_arrivals: None };
     let mut o = Options::default();
     let mut log = Log::with_events("vyges-cts");
     let mut pre: Vec<String> = Vec::new();
@@ -771,7 +805,7 @@ fn run(job: &Value) -> Result<Value, String> {
                     // `set_max_fanout V [current_design]` is the design's limit (read); on any other
                     // object it is not modelled.
                     d.sdc_max_fanout = s.max_fanout_on_objects;
-                    d.design_max_fanout = s.max_fanout.map(|v| v as f32);
+                    d.fanout_limits_mut().design = s.max_fanout.map(|v| v as f32);
                     d.clocks = s
                         .clocks
                         .iter()
@@ -793,6 +827,7 @@ fn run(job: &Value) -> Result<Value, String> {
                         Some(i) => i,
                         None => {
                             d.modes.push((name.clone(), Vec::new()));
+                            d.mode_fanout.push(FanoutLimits::default());
                             d.modes.len() - 1
                         }
                     };
@@ -805,7 +840,7 @@ fn run(job: &Value) -> Result<Value, String> {
                     let v: f32 = value.parse().map_err(|_| Stop::Refused(format!("set_max_fanout {value}: not a number")))?;
                     for name in objects.split_whitespace() {
                         if d.libs.iter().any(|l| l.cells.contains_key(name)) {
-                            d.cell_max_fanout.insert(name.to_string(), v);
+                            d.fanout_limits_mut().cells.insert(name.to_string(), v);
                         } else {
                             return vyges_cts::log::refuse(format!("set_max_fanout on {name} (not a library cell) is not modelled"));
                         }
@@ -1064,6 +1099,15 @@ fn emit_refusal(report: &Value) {
 
 #[cfg(test)]
 mod tests {
+    /// Upstream rule (`getBufferFanoutLimit`, 1202091e44 at the pin): every mode's limit is read
+    /// and the tightest wins; a mode stating none does not loosen it; none at all is no limit.
+    #[test]
+    fn the_fanout_limit_is_the_tightest_across_the_modes() {
+        assert_eq!(super::tightest_across_modes([Some(20.0), Some(12.0), None].into_iter()), Some(12));
+        assert_eq!(super::tightest_across_modes([None, Some(30.0)].into_iter()), Some(30));
+        assert_eq!(super::tightest_across_modes([None, None].into_iter()), None);
+    }
+
     use super::*;
 
     #[test]
