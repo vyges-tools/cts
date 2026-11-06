@@ -610,7 +610,10 @@ fn insert_dummy_cell(log: &mut Log, d: &mut dyn TreeDb, w: &mut Writer, o: &WOpt
     let name = format!("clkload{}", w.dummy_load_index);
     w.dummy_load_index += 1;
     let (x, y) = (t.clock.buffers[b].x, t.clock.buffers[b].y);
-    d.create_placed_inst(&best.cell, &name, x, y)?;
+    // ⛔ In the module of the buffer it loads (upstream bf8b5acb7f, unchanged 4155ac31..a6e7f507),
+    // so it joins the buffer's output net there; before the pin it was made in the top module.
+    let loaded = t.clock.buffers[b].name.clone();
+    d.create_placed_inst_beside(&best.cell, &name, x, y, &loaded)?;
     t.clock.buffers.push(crate::htree::ClockInst { name: format!("{name}_{}", t.clock.name), master: best.cell.clone(), x, y, insertion_delay: 0.0, input_cap: 0.0 });
     let dummy = t.clock.buffers.len() - 1;
     log.debug("CTS", "dummy load", 1, || format!("  placed dummy instance {name} at ( {x} {y} )"));
@@ -620,6 +623,11 @@ fn insert_dummy_cell(log: &mut Log, d: &mut dyn TreeDb, w: &mut Writer, o: &WOpt
     let net = d.iterm_net(&out).ok_or_else(|| crate::log::Stop::Refused(format!("{src}: output unconnected")))?;
     let input = first_input(d, &name).ok_or_else(|| crate::log::Stop::Refused(format!("{name}: no input")))?;
     d.connect(&input, &net)?;
+    // As for a sink: in a hierarchical design the dummy joins the net in the hierarchy too
+    // (`hierarchicalConnect`), or the hierarchical view leaves it off the net.
+    if d.has_hierarchy() {
+        d.hierarchical_connect(&out, &input, &net)?;
+    }
     t.clock.subnets[sub].insts.push(InstRef::Buffer(dummy));
     Ok(true)
 }
