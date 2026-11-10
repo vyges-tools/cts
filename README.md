@@ -1,7 +1,5 @@
 # vyges-cts
 
-**[Download Loom](https://vyges.com/products/vyges-cli/#install)** · install the free [Vyges CLI](https://vyges.com/products/vyges-cli/), then `vyges install physical`
-
 Clock tree synthesis of a placed design. Today the engine chooses the clock buffers, finds every
 clock net and collects its sinks — cloning clock gaters whose loads are spread too far apart — and
 reports each step exactly as the command's log reads. Characterization and building the trees
