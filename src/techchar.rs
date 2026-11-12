@@ -330,6 +330,8 @@ fn chain_netlist(s: &Setup, t: &Topology) -> (Netlist, Vec<(String, String, u32)
     // characterization block reaches the database (the descriptor, the input cap read through the
     // design's network) but not the timer built over that block, so every configuration is timed
     // with the characterization buffer.
+    // Index loop kept as written: the index is used beyond this container (order and bounds unchanged).
+    #[allow(clippy::needless_range_loop)]
     for k in 0..t.masters.len() {
         nl.insts.push(vyges_sta::netlist::inst(format!("buf{k}"), s.char_buf.clone()));
         let to = Conn::Inst(k, s.buf_in.clone());

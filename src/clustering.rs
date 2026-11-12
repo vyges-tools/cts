@@ -167,6 +167,8 @@ impl Clustering {
             // Collect the clusters in sink order; a sink the flow left unassigned goes to the
             // nearest mean (first on ties) whose cluster is still under `cap`, else to mean 0.
             let mut clusters: Vec<Vec<usize>> = vec![Vec::new(); n as usize];
+            // Index loop kept as written: the index is used beyond this container (order and bounds unchanged).
+            #[allow(clippy::needless_range_loop)]
             for s in 0..self.sinks.len() {
                 let sink = &self.sinks[s];
                 let position = if sink.cluster_idx >= 0 && (sink.cluster_idx as u32) < n {

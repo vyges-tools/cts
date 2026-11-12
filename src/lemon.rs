@@ -579,6 +579,8 @@ impl NetworkSimplex {
                 self.update_potential();
             }
         }
+        // Index loop kept as written: the index is used beyond this container (order and bounds unchanged).
+        #[allow(clippy::needless_range_loop)]
         for e in self.search_arc_num..self.all_arc_num {
             if self.flow[e] != 0 {
                 return false; // INFEASIBLE
