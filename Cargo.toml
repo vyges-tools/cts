@@ -13,7 +13,7 @@ repository = "https://github.com/vyges-tools/cts"
 # that link every engine and run the one they are invoked as.
 suite = ["cli"]
 # The command-line engine: the database, the wire RC, the SDC reader, and JSON jobs.
-cli = ["dep:vyges-opendb", "dep:vyges-est", "dep:vyges-loom", "dep:vyges-rsz", "vyges-rsz/cli", "dep:vyges-grt", "dep:serde_json"]
+cli = ["dep:vyges-opendb", "dep:vyges-est", "dep:vyges-loom", "dep:vyges-rsz", "vyges-rsz/cli", "dep:vyges-grt", "dep:serde_json", "dep:mimalloc", "dep:libmimalloc-sys"]
 
 [dependencies]
 # The timer's library model: cells, ports, arcs.
@@ -32,6 +32,19 @@ vyges-rsz = { git = "https://github.com/vyges-tools/rsz.git", branch = "main", o
 # arrivals on the written trees.
 vyges-grt = { git = "https://github.com/vyges-tools/grt.git", branch = "main", default-features = false, features = ["odb"], optional = true }
 serde_json = { version = "1", optional = true }
+
+# The binary's global allocator. The reference build links tcmalloc for all of its code
+# (BUILD.bazel `malloc = @tcmalloc`), not the system allocator; mimalloc measured fastest and
+# smallest of tcmalloc / jemalloc / mimalloc on a like-for-like trial. Pinned exactly:
+# libmimalloc-sys 0.1.44 bundles mimalloc v2 by default (0.1.45 on default to v3).
+mimalloc = { version = "=0.1.48", default-features = false, optional = true }
+libmimalloc-sys = { version = "=0.1.44", default-features = false, optional = true }
+
+# On Linux the allocator also REPLACES malloc/free process-wide (`override`), so C++ code linked
+# into the binary allocates through it too, as the reference's statically linked tcmalloc does for
+# all of its code. Not on macOS, where the system zone allocator is left alone.
+[target.'cfg(target_os = "linux")'.dependencies]
+libmimalloc-sys = { version = "=0.1.44", default-features = false, features = ["override"], optional = true }
 
 [lib]
 name = "vyges_cts"
@@ -72,3 +85,9 @@ vyges-loom = { path = "../vyges-tools-loom" }
 
 [patch."https://github.com/vyges-tools/layout"]
 vyges-layout = { path = "../vyges-tools-layout" }
+
+# The reference is built -O3 with link-time optimisation (Bazel --config=release). LTO and one
+# codegen unit let calls inline across crates; by language rule neither changes a result.
+[profile.release]
+lto = "fat"
+codegen-units = 1
