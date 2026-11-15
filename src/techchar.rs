@@ -483,9 +483,9 @@ pub fn create(log: &mut Log, d: &dyn CharDesign, s: &Setup) -> Res<(Lut, Vec<Res
             }
             let last = format!("n{}", ends.len() - 1);
             let base = paras[&last].pi.clone().expect("set");
-            let out_v = g.vertices.iter().position(|v| v.name == "out").expect("the output port");
-            let in_v = g.vertices.iter().position(|v| v.name == "in").expect("the input port");
-            let last_drvr = g.vertices.iter().position(|v| v.name == ends[ends.len() - 1].0).expect("the last net's driver");
+            let out_v = (0..g.vertices.len()).position(|v| g.vname(v) == "out").expect("the output port");
+            let in_v = (0..g.vertices.len()).position(|v| g.vname(v) == "in").expect("the input port");
+            let last_drvr = (0..g.vertices.len()).position(|v| g.vname(v) == ends[ends.len() - 1].0).expect("the last net's driver");
             let order = g.topo_order().map_err(crate::log::Stop::Refused)?;
             let index = g.pin_index();
             // The first topology's first update is the timer's first (full, with its settings);
@@ -536,7 +536,7 @@ pub fn create(log: &mut Log, d: &dyn CharDesign, s: &Setup) -> Res<(Lut, Vec<Res
                         let Some(l) = libs.iter().position(|l| l.cells.contains_key(m)) else { return refuse(format!("{m}: no liberty cell")) };
                         let prefix = format!("buf{k}/");
                         for v in 0..g.vertices.len() {
-                            if g.vertices[v].name.starts_with(&prefix) {
+                            if g.vname(v).starts_with(&prefix) {
                                 g.pin_cap_cell.insert(v, (l, m.clone()));
                             }
                         }

@@ -463,7 +463,7 @@ impl CliDesign {
             let mut search = vyges_sta::search::Search::in_graph_order(&g, &ssdc);
             search.find_arrivals()?;
             let mut out: HashMap<String, Vec<(f32, String)>> = HashMap::new();
-            for (v, vx) in g.vertices.iter().enumerate() {
+            for v in 0..g.vertices.len() {
                 for p in &search.paths[v] {
                     let (Some(edge), 1) = (p.tag.clk_edge, p.tag.mm) else { continue };
                     if edge % 2 != 0 {
@@ -474,12 +474,12 @@ impl CliDesign {
                     while let Some((pv, pp)) = search.prev_path(sp) {
                         (sv, sp) = (pv, pp);
                     }
-                    let start = &g.vertices[sv].name;
+                    let start = &g.vname(sv);
                     let net = match start.rsplit_once('/') {
                         Some((i, pin)) => self.db.iterm_get_net(i, pin),
                         None => self.db.bterm_get_net(start),
                     };
-                    out.entry(vx.name.clone()).or_default().push((p.arrival, net));
+                    out.entry(g.vname(v)).or_default().push((p.arrival, net));
                 }
             }
             Ok(out)
