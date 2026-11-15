@@ -500,7 +500,7 @@ impl CliDesign {
     /// `Resizer::repairClkNets` on the written design, with the constraints as read.
     fn repair_clk_nets_with(&mut self, s: &vyges_loom::sdc::Sdc, log: &mut Log, clk_buffers: &[String], max_wire_length: f64) -> Res<()> {
         use vyges_rsz::env::{constant_values_sdc, constants_by_name, constants_off_clock_networks, master_pins, no_signal_cap, placement_parasitics_at, port_caps_at, sdc_constraints, sdc_env};
-        use vyges_rsz::odb_design::{net_info, sdc_cap_pins, sdc_port_cap_limits, sizing_limits, CliDesign as RszDesign, TimerLog};
+        use vyges_rsz::odb_design::{net_info, sdc_cap_pins, sdc_port_cap_limits, sizing_limits, CliDesign as RszDesign};
         let refused = |e: String| Stop::Refused(format!("repair_clock_nets: {e}"));
         if self.routing_alpha_set {
             return vyges_cts::log::refuse("set_routing_alpha before repair_clock_nets' parasitics: not modelled");
@@ -571,7 +571,7 @@ impl CliDesign {
         let liberty = self.liberty.clone();
         let mut trace = vyges_rsz::trace::Trace::default();
         let r = {
-            let mut design = RszDesign { db: &mut self.db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, constants, constraints, alpha: 0.3, estimating, netlist: std::sync::Arc::new(netlist), netlist_gen: 0, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: true, journal: Vec::new(), sdc_nets: BTreeSet::new(), sdc_pins: sdc_cap_pins(s), timer: TimerLog::default(), stale_out_arcs: std::collections::BTreeMap::new(), gr: None, gr_error: None, undoing: false, skips: None, skip_log: false, inst_pos: None, area: 0.0 };
+            let mut design = RszDesign { constants, constraints, estimating, core, port_caps, propagated: true, sdc_pins: sdc_cap_pins(s), ..RszDesign::new(&mut self.db, &rc, &liberty, &libs, &clock_sources, netlist, parasitics, info) };
             let inputs = vyges_rsz::repair_design::Inputs { libs: &libs, masters: &masters, dont_use: &dont_use, limits, clock_sources: &clock_sources, dbu, wire_rc, sdc: env, master_pins: mpins, sizing_limits: block_limits, clock_pattern: self.clock_pattern.clone() };
             let order = |p: &str| ids.get(p).copied().unwrap_or(u64::MAX);
             vyges_rsz::repair_design::repair_clk_nets(&inputs, &mut design, clk_buffers, &clocks, &order, max_wire_length, &mut trace)
