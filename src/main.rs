@@ -728,8 +728,25 @@ impl CliDesign {
     }
 }
 
-fn read_text(path: &str) -> Result<String, String> {
-    std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))
+/// A liberty file's text. The reference opens every liberty through `gzstream::igzstream`
+/// (`parseLibertyFile`), i.e. zlib's `gzopen`, which reads a gzip stream or plain text alike and
+/// tells them apart by CONTENT, not by the file's name.
+fn read_liberty_text(path: &str) -> Result<String, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    liberty_text(bytes).map_err(|e| format!("{path}: {e}"))
+}
+
+/// `gzopen`'s rule: a stream that starts with the gzip magic (1f 8b) is decompressed, every
+/// member in turn as `gzread` does; anything else is read as it is.
+fn liberty_text(bytes: Vec<u8>) -> Result<String, String> {
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        use std::io::Read;
+        let mut s = String::new();
+        flate2::read::MultiGzDecoder::new(bytes.as_slice()).read_to_string(&mut s).map_err(|e| e.to_string())?;
+        Ok(s)
+    } else {
+        String::from_utf8(bytes).map_err(|e| e.to_string())
+    }
 }
 
 fn run(job: &Value) -> Result<Value, String> {
@@ -758,7 +775,7 @@ fn run(job: &Value) -> Result<Value, String> {
                         return vyges_cts::log::refuse(format!("read_liberty {}: options are not modelled", args.join(" ")));
                     }
                     let path = args.last().ok_or_else(|| Stop::Refused("read_liberty path".into()))?;
-                    let text = read_text(path).map_err(Stop::Refused)?;
+                    let text = read_liberty_text(path).map_err(Stop::Refused)?;
                     d.liberty.read(&text).map_err(|e| Stop::Refused(format!("{path}: {e}")))?;
                     let group = vyges_sta::liberty_parse::parse(&text).map_err(|e| Stop::Refused(format!("{path}: {e}")))?;
                     d.libs.push(Library::read(&group).map_err(|e| Stop::Refused(format!("{path}: {e} (not modelled)")))?);
@@ -1141,6 +1158,33 @@ mod tests {
         let m = d["maturity"].as_str().expect("maturity is a string");
         assert!(["discovered", "structured", "workflow-validated"].contains(&m), "{m}");
         assert_eq!(m, "structured");
+    }
+
+    /// `parseLibertyFile` reads through `gzstream::igzstream` (zlib `gzopen`): gzip or plain is
+    /// decided by the stream's first bytes, never by the name, and every gzip member is read.
+    #[test]
+    fn a_liberty_is_gunzipped_by_its_content_not_its_name() {
+        use flate2::{write::GzEncoder, Compression};
+        use std::io::Write;
+        let gz = |t: &str| {
+            let mut e = GzEncoder::new(Vec::new(), Compression::default());
+            e.write_all(t.as_bytes()).expect("writing to a Vec cannot fail");
+            e.finish().expect("finishing a Vec cannot fail")
+        };
+        assert_eq!(liberty_text(b"library (x) { }".to_vec()).unwrap(), "library (x) { }");
+        assert_eq!(liberty_text(gz("library (y) { }")).unwrap(), "library (y) { }");
+        let mut two = gz("library (z) ");
+        two.extend(gz("{ }"));
+        assert_eq!(liberty_text(two).unwrap(), "library (z) { }", "every member, as gzread reads them");
+        // Named `.lib` but gzipped (and the reverse) on disk: the content decides.
+        let dir = std::env::temp_dir().join(format!("vyges-cts-gz-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.lib"), dir.join("b.lib.gz"));
+        std::fs::write(&a, gz("library (a) { }")).unwrap();
+        std::fs::write(&b, "library (b) { }").unwrap();
+        assert_eq!(read_liberty_text(a.to_str().unwrap()).unwrap(), "library (a) { }");
+        assert_eq!(read_liberty_text(b.to_str().unwrap()).unwrap(), "library (b) { }");
+        assert!(liberty_text(vec![0x1f, 0x8b, 0, 0]).is_err(), "a broken gzip stream is an error");
     }
 
     // Rule (vacuous convention): only a checked nothing-to-do exits 0; a refusal never does.

@@ -13,7 +13,7 @@ repository = "https://github.com/vyges-tools/cts"
 # that link every engine and run the one they are invoked as.
 suite = ["cli"]
 # The command-line engine: the database, the wire RC, the SDC reader, and JSON jobs.
-cli = ["dep:vyges-opendb", "dep:vyges-est", "dep:vyges-loom", "dep:vyges-rsz", "vyges-rsz/cli", "dep:vyges-grt", "dep:serde_json", "dep:mimalloc", "dep:libmimalloc-sys"]
+cli = ["dep:vyges-opendb", "dep:vyges-est", "dep:vyges-loom", "dep:vyges-rsz", "vyges-rsz/cli", "dep:vyges-grt", "dep:serde_json", "dep:flate2", "dep:mimalloc", "dep:libmimalloc-sys"]
 
 [dependencies]
 # The timer's library model: cells, ports, arcs.
@@ -32,6 +32,8 @@ vyges-rsz = { git = "https://github.com/vyges-tools/rsz.git", branch = "main", o
 # arrivals on the written trees.
 vyges-grt = { git = "https://github.com/vyges-tools/grt.git", branch = "main", default-features = false, features = ["odb"], optional = true }
 serde_json = { version = "1", optional = true }
+# A gzipped liberty, read as the reference reads one (zlib `gzopen`).
+flate2 = { version = "1", optional = true }
 
 # The binary's global allocator. The reference build links tcmalloc for all of its code
 # (BUILD.bazel `malloc = @tcmalloc`), not the system allocator; mimalloc measured fastest and
