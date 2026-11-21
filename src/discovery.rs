@@ -641,9 +641,20 @@ fn separate_macro_reg_sinks(d: &dyn ClockDesign, log: &mut Log, s: &Setup, net: 
                 if cell.is_inverter() {
                     let out = d.inst_iterms(inst).into_iter().find(|o| d.iterm_is_output_signal(o, true));
                     let out_net = out.and_then(|o| d.iterm_net(&o));
-                    let first_in = out_net.and_then(|n| d.net_iterms(&n).into_iter().find(|x| d.iterm_is_input_signal(x, false)));
-                    match first_in {
-                        Some(x) => non_sink_macro &= d.inst_is_block(&x.0),
+                    // The output net's loads in `getITerms()` order: (is input signal, is block,
+                    // is a register sink), and its port count.
+                    let (bterms, loads) = match &out_net {
+                        Some(n) => (
+                            d.net_bterms(n).len(),
+                            d.net_iterms(n)
+                                .into_iter()
+                                .map(|x| (d.iterm_is_input_signal(&x, true), d.inst_is_block(&x.0), is_sink(d, &x)))
+                                .collect(),
+                        ),
+                        None => (0, Vec::new()),
+                    };
+                    match inverter_non_sink_macro(non_sink_macro, bterms, &loads) {
+                        Some(v) => non_sink_macro = v,
                         None => log.warn("CTS", 136, format!("Inverter {inst} output net has no signal input; treating as a dangling clock inverter.")),
                     }
                 }
@@ -662,6 +673,39 @@ fn separate_macro_reg_sinks(d: &dyn ClockDesign, log: &mut Log, s: &Setup, net: 
         }
     }
     Ok(Some((regs, macros)))
+}
+
+/// `separateMacroRegSinks`' inverter test (OpenROAD #11728, in the f11b4276 pin): count the
+/// inverter's output loads — its PORTS first, then the input-signal iterms in `getITerms()` order,
+/// stopping once the count passes one.
+///
+/// - one load, an iterm: a REGISTER sink only when that load is a register — a macro or a clock
+///   gater (not `isSink`) keeps the inverter on the macro side;
+/// - one load, a port: a leaf with no tree below — a register sink;
+/// - more than one load: unchanged (an inverter input is not a register clock pin, so a macro);
+/// - none: `None` — CTS-136, unchanged.
+///
+/// Before the pin only the FIRST signal input decided, and only by `isBlock`.
+pub fn inverter_non_sink_macro(non_sink_macro: bool, bterms: usize, loads: &[(bool, bool, bool)]) -> Option<bool> {
+    let mut count = bterms;
+    let mut lone: Option<(bool, bool)> = None;
+    for &(is_input, is_block, is_sink) in loads {
+        if count > 1 {
+            break;
+        }
+        if is_input {
+            count += 1;
+            lone = Some((is_block, is_sink));
+        }
+    }
+    match count {
+        0 => None,
+        1 => Some(match lone {
+            Some((is_block, is_sink)) => non_sink_macro && (is_block || !is_sink),
+            None => false,
+        }),
+        _ => Some(non_sink_macro),
+    }
 }
 
 fn sink_name(t: &ITerm) -> String {
@@ -709,6 +753,24 @@ fn add_clock_sinks(log: &mut Log, f: &mut Found, net: &str, input_net: &str, clk
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_inverter_is_a_register_sink_only_when_its_lone_load_is_a_register() {
+        // Upstream rule (separateMacroRegSinks, OpenROAD #11728 at the f11b4276 pin): ports count
+        // as loads first; one register load -> register sink; one macro or clock-gater load ->
+        // macro side; one port -> leaf (register sink); several -> macro side; none -> CTS-136.
+        let reg = (true, false, true);
+        let mac = (true, true, true);
+        let gater = (true, false, false);
+        let out = (false, false, false);
+        assert_eq!(super::inverter_non_sink_macro(true, 0, &[out, reg]), Some(false));
+        assert_eq!(super::inverter_non_sink_macro(true, 0, &[mac]), Some(true));
+        assert_eq!(super::inverter_non_sink_macro(true, 0, &[gater]), Some(true));
+        assert_eq!(super::inverter_non_sink_macro(true, 1, &[out]), Some(false), "a lone port is a leaf");
+        assert_eq!(super::inverter_non_sink_macro(true, 0, &[reg, reg]), Some(true), "two loads: macro side");
+        assert_eq!(super::inverter_non_sink_macro(true, 1, &[reg]), Some(true), "a port and a register");
+        assert_eq!(super::inverter_non_sink_macro(true, 0, &[out]), None);
+    }
     use super::ModeRoots;
 
     fn n(v: &[&str]) -> Vec<Option<String>> {
