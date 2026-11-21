@@ -440,7 +440,7 @@ impl CliDesign {
         if self.routing_alpha_set {
             return Err("set_routing_alpha before the latency balancer's parasitics: not modelled".into());
         }
-        let libs = vyges_rsz::preamble::Libs { libs: self.libs.clone(), scenes: Vec::new(), scene_libs: Vec::new(), link_scene: None };
+        let libs = vyges_rsz::preamble::Libs { libs: self.libs.clone(), scenes: Vec::new(), scene_libs: Vec::new(), link_scene: None, ..Default::default() };
         let netlist = vyges_grt::timer::netlist(&self.db);
         let mut s = self.sdc.take().ok_or("the latency balancer without constraints: not modelled")?;
         // Every non-virtual clock propagated, whatever set_propagated_clock named.
@@ -505,7 +505,7 @@ impl CliDesign {
         if self.routing_alpha_set {
             return vyges_cts::log::refuse("set_routing_alpha before repair_clock_nets' parasitics: not modelled");
         }
-        let libs = vyges_rsz::preamble::Libs { libs: self.libs.clone(), scenes: Vec::new(), scene_libs: Vec::new(), link_scene: None };
+        let libs = vyges_rsz::preamble::Libs { libs: self.libs.clone(), scenes: Vec::new(), scene_libs: Vec::new(), link_scene: None, ..Default::default() };
         let lib0 = libs.default_library().ok_or_else(|| Stop::Refused("no liberty library".into()))?;
         if lib0.time_scale != 1e-9f32 {
             return vyges_cts::log::refuse("a library time unit other than 1ns: not modelled");
@@ -646,7 +646,7 @@ impl Design for CliDesign {
         if self.rc.resolve(&self.tech, |w| &w.signal_res).is_empty() || (rc.h_res + rc.v_res) / 2.0 <= 0.0 {
             return Ok(f64::NEG_INFINITY);
         }
-        let libs = vyges_rsz::preamble::Libs { libs: self.libs.clone(), scenes: Vec::new(), scene_libs: Vec::new(), link_scene: None };
+        let libs = vyges_rsz::preamble::Libs { libs: self.libs.clone(), scenes: Vec::new(), scene_libs: Vec::new(), link_scene: None, ..Default::default() };
         let masters = rsz_masters(&self.db)?;
         let mut dont_use = self.set_dont_use.clone();
         for lib in &self.libs {
@@ -812,7 +812,7 @@ fn run(job: &Value) -> Result<Value, String> {
                     let s = if d.db.inst_names().is_empty() {
                         vyges_loom::sdc::Sdc::load(path)
                     } else {
-                        let libs = vyges_rsz::preamble::Libs { libs: d.libs.clone(), scenes: Vec::new(), scene_libs: Vec::new(), link_scene: None };
+                        let libs = vyges_rsz::preamble::Libs { libs: d.libs.clone(), scenes: Vec::new(), scene_libs: Vec::new(), link_scene: None, ..Default::default() };
                         vyges_loom::sdc::Sdc::load_with(path, &vyges_rsz::env::sdc_design(&d.db, &libs))
                     }
                     .map_err(|e| Stop::Refused(format!("{path}: {}", e.0)))?;
