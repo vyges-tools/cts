@@ -35,9 +35,11 @@ fn contains_ignore_case(s: &str, sub: &str) -> bool {
     s.to_ascii_lowercase().contains(&sub.to_ascii_lowercase())
 }
 
-/// `Resizer::isClockCellCandidate`.
+/// `Resizer::isClockCellCandidate`: not dont_use (liberty or the resizer's), always-on,
+/// isolation or level shifter — and, since OpenROAD #12275, with a LEF master (`staToDb(cell)`):
+/// a liberty-only cell such as a pad model is no candidate.
 fn is_clock_cell_candidate(cell: &Cell, libs: &dyn BufferLibs) -> bool {
-    !cell.dont_use && !libs.resizer_dont_use(&cell.name) && !cell.always_on && !cell.is_isolation_cell && !cell.is_level_shifter
+    !cell.dont_use && !libs.resizer_dont_use(&cell.name) && !cell.always_on && !cell.is_isolation_cell && !cell.is_level_shifter && libs.has_master(&cell.name)
 }
 
 /// `LibertyLibrary::buffers()`: the library's cells by name (its cell map's order), each a
@@ -478,8 +480,9 @@ mod tests {
         fn libraries(&self) -> &[Library] {
             &self.0
         }
+        /// A cell named `…_NOLEF` is liberty-only.
         fn has_master(&self, name: &str) -> bool {
-            self.liberty_cell(name).is_some()
+            self.liberty_cell(name).is_some() && !name.ends_with("_NOLEF")
         }
         fn liberty_cell(&self, name: &str) -> Option<&Cell> {
             self.0.iter().find_map(|l| l.cells.get(name))
@@ -504,6 +507,10 @@ mod tests {
         assert_eq!(infer_clock_buffer_list(&Options::default(), &mut log, &l).unwrap(), ["BUF_X2"], "is_clock_cell wins");
         let l = Libs(vec![lib(&[("BUF_X2", 1.0, Some(0.1), false), ("CLKBUF_X1", 1.0, Some(0.1), false)])], vec!["CLKBUF_X1"]);
         assert_eq!(infer_clock_buffer_list(&Options::default(), &mut log, &l).unwrap(), ["BUF_X2"], "dont_use drops CLKBUF");
+        // Rule (isClockCellCandidate, OpenROAD #12275): a liberty-only cell (no LEF master) is no
+        // candidate.
+        let l = Libs(vec![lib(&[("BUF_X2", 1.0, Some(0.1), false), ("CLKBUF_X1_NOLEF", 1.0, Some(0.1), false)])], vec![]);
+        assert_eq!(infer_clock_buffer_list(&Options::default(), &mut log, &l).unwrap(), ["BUF_X2"], "no master drops CLKBUF");
     }
 
     // Rule (selectBestMaxCapBuffer): the smallest area with max cap × derate (a double) above the
