@@ -350,13 +350,22 @@ pub fn populate_triton_cts(d: &mut dyn ClockDesign, log: &mut Log, s: &Setup, mo
     // Every instance's location, so a clone never lands on one (mapLocationToSink_ keys).
     let mut occupied: BTreeSet<(i32, i32)> = d.inst_locations().into_iter().collect();
     let mut clone_visited: HashSet<String> = HashSet::new();
+    // ⛔ **Every root net is cloned BEFORE any is discovered** (OpenROAD #12261, in the f11b4276
+    // pin): `populateTritonCTS` runs `cloneClockGaters` (then, with sink clustering, the clock
+    // gate split) over all of them in a pass of its own, and only then the CTS-0007 / CTS-0095
+    // discovery pass. With two root nets the second net's cloning lines now come before the
+    // first net's CTS-0007; before the pin they were interleaved.
+    for (nets, _) in &info {
+        for net in nets.iter().flatten() {
+            clone_clock_gaters(d, log, s, &mut f, net, &mut occupied, &mut clone_visited)?;
+        }
+    }
     for (nets, clk_name) in &info {
         for net in nets {
             let Some(net) = net else {
                 log.warn("CTS", 40, format!("Net was not found in the design for {clk_name}, please check. Skipping..."));
                 continue;
             };
-            clone_clock_gaters(d, log, s, &mut f, net, &mut occupied, &mut clone_visited)?;
             if clk_name.is_empty() {
                 log.info("CTS", 95, format!("Net \"{net}\" found."));
             } else {
