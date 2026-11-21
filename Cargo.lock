@@ -524,8 +524,9 @@ dependencies = [
 [[package]]
 name = "vyges-events"
 version = "0.1.55"
-source = "git+https://github.com/vyges-tools/events.git?branch=main#87cca49dfd0e7030b890a084472a00930bcfb45e"
+source = "git+https://github.com/vyges-tools/events.git?branch=main#99cbea768cd047d1c028c1d38b441da6be0b9b67"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
 ]
@@ -540,6 +541,7 @@ name = "vyges-grt"
 version = "0.1.55"
 dependencies = [
  "vyges-est",
+ "vyges-events",
  "vyges-opendb",
  "vyges-sta",
 ]
