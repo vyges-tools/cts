@@ -256,6 +256,19 @@ fn internal_delay(libs: &dyn BufferLibs, buf: &str) -> f32 {
     libs.liberty_cell(buf).and_then(|c| c.buffer_ports().map(|(_, out)| c.intrinsic_delay(&out.name))).unwrap_or(0.0)
 }
 
+/// Whether two DIFFERENT buffer names share a sort key, the only ties an unstable sort can make
+/// observable. Rule (`Resizer::inferClockBufferList` walks every liberty library and keeps each
+/// candidate, so a design reading the same cells for several scenes lists each name once per
+/// library; `getDrvrResistance` / `getMaxCapLimit` look a name up through its master, so every
+/// copy of a name has the same key): copies of one name are indistinguishable wherever the
+/// introsort puts them.
+fn ties_between_distinct_names(names: &[String], key: impl Fn(&str) -> f32) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    let mut keys: Vec<f32> = names.iter().filter(|n| seen.insert(n.as_str())).map(|n| key(n)).collect();
+    keys.sort_by(f32::total_cmp);
+    keys.windows(2).any(|w| w[0] == w[1])
+}
+
 /// `TechChar::createDelayBufList` (upstream, delay-buffer series ending `55fb63162f`): the buffers
 /// latency balancing may insert, printed under `insertion delay` debug.
 ///
@@ -298,12 +311,8 @@ pub fn create_delay_buf_list(o: &Options, log: &mut Log, libs: &dyn BufferLibs) 
     }
     let mut by_res = o.buffer_list.clone();
     // `std::ranges::sort` is not stable; below 17 elements it is an insertion sort, which is.
-    if by_res.len() > 16 {
-        let mut r: Vec<f32> = by_res.iter().map(|b| drvr_resistance(libs, b)).collect();
-        r.sort_by(f32::total_cmp);
-        if r.windows(2).any(|w| w[0] == w[1]) {
-            return crate::log::refuse("more than 16 clock buffers with equal drive resistances: the introsort's tie order is not modelled");
-        }
+    if by_res.len() > 16 && ties_between_distinct_names(&by_res, |b| drvr_resistance(libs, b)) {
+        return crate::log::refuse("more than 16 clock buffers with equal drive resistances: the introsort's tie order is not modelled");
     }
     by_res.sort_by(|a, b| drvr_resistance(libs, a).total_cmp(&drvr_resistance(libs, b)));
     let mut delay_buffers: Vec<String> = Vec::new();
@@ -363,13 +372,8 @@ pub fn trim_sort_buffer_list(o: &Options, log: &mut Log, libs: &dyn BufferLibs, 
         });
     }
     // `std::ranges::sort` is not stable; below 17 elements it is an insertion sort, which is.
-    if buffers.len() > 16 {
-        let caps: Vec<f32> = buffers.iter().map(|b| max_cap_limit(libs, b)).collect();
-        let mut sorted = caps.clone();
-        sorted.sort_by(f32::total_cmp);
-        if sorted.windows(2).any(|w| w[0] == w[1]) {
-            return crate::log::refuse("more than 16 clock buffers with equal max caps: the introsort's tie order is not modelled");
-        }
+    if buffers.len() > 16 && ties_between_distinct_names(&buffers, |b| max_cap_limit(libs, b)) {
+        return crate::log::refuse("more than 16 clock buffers with equal max caps: the introsort's tie order is not modelled");
     }
     buffers.sort_by(|a, b| max_cap_limit(libs, a).total_cmp(&max_cap_limit(libs, b)));
     if o.buffer_list_inferred && !buffers.is_empty() {
@@ -585,5 +589,30 @@ mod tests {
         assert_eq!(create_delay_buf_list(&o, &mut log, &l).unwrap(), ["B2", "B4"], "a given list adds no clkdly cells");
         o.buffer_list_inferred = true;
         assert_eq!(create_delay_buf_list(&o, &mut log, &l).unwrap(), ["B2", "B4", "D1"]);
+    }
+
+    // Rule (inferClockBufferList keeps a candidate per library; the sort keys are looked up by
+    // name): above 16 buffers the reference's sort is an introsort, unstable, but copies of ONE
+    // name are interchangeable, so only a key shared by two different names is refused.
+    #[test]
+    fn copies_of_a_name_are_no_tie_two_names_with_one_key_are() {
+        let cells: Vec<(String, f32, f32)> = (0..6).map(|i| (format!("B{i}"), 1.0 + i as f32, 0.1)).collect();
+        let one = |extra: &[(&str, f32, f32, &str)]| {
+            let mut c: Vec<(&str, f32, f32, &str)> = cells.iter().map(|(n, r, d)| (n.as_str(), *r, *d, "buf")).collect();
+            c.extend_from_slice(extra);
+            timed(&c)
+        };
+        // Three scenes' worth of the same six buffers: 18 names, every key three times.
+        let l = Libs(vec![one(&[])], vec![]);
+        let list: Vec<String> = (0..3).flat_map(|_| cells.iter().map(|c| c.0.clone())).collect();
+        let o = Options { buffer_list: list.clone(), ..Default::default() };
+        let mut log = Log::default();
+        assert_eq!(create_delay_buf_list(&o, &mut log, &l).unwrap(), ["B0", "B1", "B2", "B3", "B4", "B5"]);
+        // A seventh name with B5's resistance: a real tie.
+        let l = Libs(vec![one(&[("C5", 6.0, 0.1, "buf")])], vec![]);
+        let mut list = list;
+        list.push("C5".into());
+        let o = Options { buffer_list: list, ..Default::default() };
+        assert!(matches!(create_delay_buf_list(&o, &mut log, &l), Err(crate::log::Stop::Refused(_))));
     }
 }
