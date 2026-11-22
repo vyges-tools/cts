@@ -98,6 +98,16 @@ fn tightest_across_modes(limits: impl Iterator<Item = Option<f32>>) -> Option<i3
 struct CliDesign {
     db: Db,
     libs: Vec<Library>,
+    /// Each library's `read_liberty` path, parallel to `libs`.
+    lib_paths: Vec<String>,
+    /// `define_scene`: each scene's name and its libraries (indices into `libs`), in definition
+    /// order (the timer's `scenes()`); empty when the script defines none.
+    scenes: Vec<(String, Vec<usize>)>,
+    /// `set_scene`: the command scene (an index into `scenes`).
+    cmd_scene: Option<usize>,
+    /// The scene commands as given (`define_scene` name and libraries; `set_scene` with an empty
+    /// name), replayed into the resizer's own scene model for the resizer steps cts runs.
+    scene_cmds: Vec<(String, Vec<String>)>,
     rc: vyges_est::rc::Rc,
     tech: String,
     clocks: Vec<SdcClock>,
@@ -132,6 +142,114 @@ struct CliDesign {
 }
 
 impl CliDesign {
+    fn empty() -> CliDesign {
+        CliDesign { db: Db::new(), libs: Vec::new(), lib_paths: Vec::new(), scenes: Vec::new(), cmd_scene: None, scene_cmds: Vec::new(), rc: vyges_est::rc::Rc::new(), tech: String::new(), clocks: Vec::new(), modes: Vec::new(), cur_mode: None, dont_use: BTreeSet::new(), set_dont_use: BTreeSet::new(), routing_alpha_set: false, clock_pattern: Default::default(), masters: HashSet::new(), net_ids: HashMap::new(), bterms: HashSet::new(), sdc_max_fanout: false, default_fanout: FanoutLimits::default(), mode_fanout: Vec::new(), liberty: vyges_est::liberty::LibertyClocks::default(), sdc: None, clock_arrivals: None }
+    }
+
+    /// `define_scene name [-mode m] -liberty {libs}`: a scene of libraries already read, named by
+    /// their file as read or their library name. A scene of the same name is redefined in place.
+    fn define_scene(&mut self, args: &[String]) -> Res<()> {
+        let mut name = None;
+        let mut libs = None;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "-liberty" | "-mode" if i + 1 < args.len() => {
+                    // `-mode`: the scene's mode; cts builds the clocks of every mode, so it is not read.
+                    if args[i] == "-liberty" {
+                        libs = Some(args[i + 1].clone());
+                    }
+                    i += 2;
+                }
+                a if a.starts_with('-') => return vyges_cts::log::refuse(format!("define_scene {a}: not modelled")),
+                a => {
+                    if name.replace(a.to_string()).is_some() {
+                        return vyges_cts::log::refuse(format!("define_scene {}: one scene name", args.join(" ")));
+                    }
+                    i += 1;
+                }
+            }
+        }
+        let (Some(name), Some(libs)) = (name, libs) else { return vyges_cts::log::refuse(format!("define_scene {}: needs a name and -liberty", args.join(" "))) };
+        let mut ix = Vec::new();
+        for w in libs.split_whitespace() {
+            let Some(k) = (0..self.libs.len()).find(|&k| self.lib_paths[k] == w || self.libs[k].name == w) else {
+                return vyges_cts::log::refuse(format!("define_scene {name} -liberty {w}: not a library read before it (not modelled)"));
+            };
+            ix.push(k);
+        }
+        if self.scenes.iter().any(|(n, _)| *n == name) {
+            return vyges_cts::log::refuse(format!("define_scene {name}: a scene defined twice is not modelled"));
+        }
+        self.scene_cmds.push((name.clone(), libs.split_whitespace().map(String::from).collect()));
+        self.scenes.push((name, ix));
+        let r = self.rsz_libs_checked()?;
+        self.rc.define_corners(&r.scenes);
+        Ok(())
+    }
+
+    /// The resizer's scene model, replayed from the reads and the scene commands. A cell name in
+    /// two of a scene's libraries makes their read order observable: refused, as in the
+    /// resizer's own job.
+    fn rsz_libs_checked(&self) -> Res<vyges_rsz::preamble::Libs> {
+        let mut r = vyges_rsz::preamble::Libs { libs: self.libs.clone(), lib_files: self.lib_paths.clone(), ..Default::default() };
+        for (name, args) in &self.scene_cmds {
+            if name.is_empty() {
+                r.set_scene(&args[0]).map_err(Stop::Refused)?;
+            } else {
+                r.define_scene(name, args).map_err(Stop::Refused)?;
+                if let Some(why) = r.align_scene_order().first() {
+                    return vyges_cts::log::refuse(format!("define_scene {name}: {why}"));
+                }
+            }
+        }
+        Ok(r)
+    }
+
+    /// The libraries as the resizer steps cts runs read them: the link libraries alone with no
+    /// scene defined, else every scene as the resizer's `define_scene` makes it (its
+    /// `findMaxWireLength` times each buffer in every scene and keeps the largest delay; its
+    /// initial bracket is the LINK cell's drive resistance). Witnessed: with typ, slow and fast
+    /// scenes in any order every buffer's length is the slow library's to the bracket's 1%, and
+    /// the per-scene loop repeats the same lengths.
+    fn rsz_libs(&self) -> vyges_rsz::preamble::Libs {
+        if self.scenes.is_empty() {
+            vyges_rsz::preamble::Libs { libs: self.libs.clone(), scenes: Vec::new(), scene_libs: Vec::new(), link_scene: None, ..Default::default() }
+        } else {
+            // checked when each scene was defined
+            self.rsz_libs_checked().unwrap_or_default()
+        }
+    }
+
+    /// Several scenes, as clock_tree_synthesis reads them. TritonCTS times and characterises in
+    /// the FIRST scene (`TechChar` rebuilds `scenes()` in its own timer and characterises in the
+    /// first; the latency balancer takes a sink's first max path in `VertexPathIterator` order),
+    /// while the network's cells (buffer choice, pin caps, `computeBufferDelay`'s ports) are the
+    /// link cells: the first library read that has the cell. `computeBufferDelay` loops every
+    /// scene, but `timingArcSets(from, to)` is keyed by the LINK cell's ports, so only a scene whose
+    /// cell is the link cell itself adds an arc: its result is the link cell's. Wire RC is read in
+    /// the command scene (`cmdScene()`), the same in all unless `-corner` gives one.
+    /// ⟹ Modelled when, for every cell, the first scene's cell (the last of its libraries with
+    /// that name, as `makeSceneMap` leaves it) is the link cell; the run then is the link
+    /// libraries' run, whatever the command scene.
+    fn scenes_modelled(&self) -> Res<()> {
+        let Some((first, ix)) = self.scenes.first() else { return Ok(()) };
+        for (k, lib) in self.libs.iter().enumerate() {
+            for cell in lib.cells.keys() {
+                let link = self.libs.iter().position(|l| l.cells.contains_key(cell)).unwrap_or(k);
+                if let Some(&scene_lib) = ix.iter().rev().find(|&&j| self.libs[j].cells.contains_key(cell)) {
+                    if scene_lib != link {
+                        return vyges_cts::log::refuse(format!(
+                            "scene {first}: cell {cell} is characterised from {} but linked from {} (a first scene whose library is not the link library): not modelled",
+                            self.lib_paths[scene_lib], self.lib_paths[link]
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn refresh(&mut self) {
         self.masters = (0..self.db.num_masters().unwrap_or(0)).filter_map(|i| self.db.nth_master_name(i).ok()).collect();
         self.net_ids = self.db.block_get_nets().into_iter().enumerate().map(|(i, n)| (n, i as u32)).collect();
@@ -436,11 +554,11 @@ impl CliDesign {
     /// each max path of a rising clock edge (in the search's order) and the net its clock path
     /// starts on.
     fn clock_arrival_table(&mut self) -> Result<HashMap<String, Vec<(f32, String)>>, String> {
-        use vyges_rsz::env::{master_pins, placement_parasitics_at, port_caps_at, sdc_env, search_sdc, sim_constants};
+        use vyges_rsz::env::{master_pins, placement_parasitics_at, port_caps_at, sdc_env, sim_constants};
         if self.routing_alpha_set {
             return Err("set_routing_alpha before the latency balancer's parasitics: not modelled".into());
         }
-        let libs = vyges_rsz::preamble::Libs { libs: self.libs.clone(), scenes: Vec::new(), scene_libs: Vec::new(), link_scene: None, ..Default::default() };
+        let libs = self.rsz_libs();
         let netlist = vyges_grt::timer::netlist(&self.db);
         let mut s = self.sdc.take().ok_or("the latency balancer without constraints: not modelled")?;
         // Every non-virtual clock propagated, whatever set_propagated_clock named.
@@ -459,7 +577,10 @@ impl CliDesign {
             let mut g = vyges_rsz::repair_design::timer_graph(&libs, 0, &netlist, &env, &mpins).map_err(|e| e.message().to_string())?;
             g.find_delays(&par[0], None)?;
             let time_scale = libs.default_library().ok_or("no liberty library")?.time_scale;
-            let ssdc = search_sdc(&s, time_scale, true, false)?;
+            // `setAllClocksPropagated` after the constraints were read: every real clock
+            // propagated (its network latency removed), virtual clocks kept ideal with theirs;
+            // the constraints as the mode's timer reads them (uncertainties, exceptions, groups).
+            let ssdc = vyges_sta::scenes::mode_search_sdc(&s, &netlist, time_scale, true)?;
             let mut search = vyges_sta::search::Search::in_graph_order(&g, &ssdc);
             search.find_arrivals()?;
             let mut out: HashMap<String, Vec<(f32, String)>> = HashMap::new();
@@ -505,7 +626,7 @@ impl CliDesign {
         if self.routing_alpha_set {
             return vyges_cts::log::refuse("set_routing_alpha before repair_clock_nets' parasitics: not modelled");
         }
-        let libs = vyges_rsz::preamble::Libs { libs: self.libs.clone(), scenes: Vec::new(), scene_libs: Vec::new(), link_scene: None, ..Default::default() };
+        let libs = self.rsz_libs();
         let lib0 = libs.default_library().ok_or_else(|| Stop::Refused("no liberty library".into()))?;
         if lib0.time_scale != 1e-9f32 {
             return vyges_cts::log::refuse("a library time unit other than 1ns: not modelled");
@@ -528,7 +649,7 @@ impl CliDesign {
         let mut rc = self.rc.clone();
         rc.sort_clk_and_signal_layers();
         let caps = port_caps_at(None, Some(s), &libs, &netlist).map_err(refused)?;
-        let parasitics = placement_parasitics_at(&self.db, &rc, &self.liberty, &clock_sources, true, 0.3, 1, &caps).map_err(refused)?;
+        let parasitics = placement_parasitics_at(&self.db, &rc, &self.liberty, &clock_sources, true, 0.3, libs.scene_count(), &caps).map_err(refused)?;
         let wire_rc: Vec<vyges_rsz::buffered_net::WireRc> = (0..libs.scene_count().max(1))
             .map(|k| {
                 let v = rc.resolved(&self.tech, k);
@@ -646,7 +767,7 @@ impl Design for CliDesign {
         if self.rc.resolve(&self.tech, |w| &w.signal_res).is_empty() || (rc.h_res + rc.v_res) / 2.0 <= 0.0 {
             return Ok(f64::NEG_INFINITY);
         }
-        let libs = vyges_rsz::preamble::Libs { libs: self.libs.clone(), scenes: Vec::new(), scene_libs: Vec::new(), link_scene: None, ..Default::default() };
+        let libs = self.rsz_libs();
         let masters = rsz_masters(&self.db)?;
         let mut dont_use = self.set_dont_use.clone();
         for lib in &self.libs {
@@ -660,7 +781,9 @@ impl Design for CliDesign {
             let terms = self.db.master_mterms(m).map_err(|e| Stop::Refused(format!("{m}: {e}")))?;
             master_pins.insert(m.clone(), terms.into_iter().filter(|(_, t)| t != "POWER" && t != "GROUND").map(|(n, _)| n).collect());
         }
-        let ctx = vyges_rsz::max_wire_length::Ctx { libs: &libs, buffers: &buffers.cells, tgt_slews, wire_rc: std::slice::from_ref(&rc), master_pins: &master_pins };
+        // One wire RC per scene: `-corner` is refused with scenes, so every scene has the same.
+        let wire_rc = vec![rc; libs.scene_count()];
+        let ctx = vyges_rsz::max_wire_length::Ctx { libs: &libs, buffers: &buffers.cells, tgt_slews, wire_rc: &wire_rc, master_pins: &master_pins };
         let mut lengths = Vec::new();
         vyges_rsz::max_wire_length::find_max_wire_length(&ctx, &mut lengths).map_err(|e| Stop::Refused(format!("findMaxWireLength: {}", e.message())))
     }
@@ -750,7 +873,7 @@ fn liberty_text(bytes: Vec<u8>) -> Result<String, String> {
 }
 
 fn run(job: &Value) -> Result<Value, String> {
-    let mut d = CliDesign { db: Db::new(), libs: Vec::new(), rc: vyges_est::rc::Rc::new(), tech: String::new(), clocks: Vec::new(), modes: Vec::new(), cur_mode: None, dont_use: BTreeSet::new(), set_dont_use: BTreeSet::new(), routing_alpha_set: false, clock_pattern: Default::default(), masters: HashSet::new(), net_ids: HashMap::new(), bterms: HashSet::new(), sdc_max_fanout: false, default_fanout: FanoutLimits::default(), mode_fanout: Vec::new(), liberty: vyges_est::liberty::LibertyClocks::default(), sdc: None, clock_arrivals: None };
+    let mut d = CliDesign::empty();
     let mut o = Options::default();
     let mut log = Log::with_events("vyges-cts");
     let mut pre: Vec<String> = Vec::new();
@@ -779,8 +902,21 @@ fn run(job: &Value) -> Result<Value, String> {
                     d.liberty.read(&text).map_err(|e| Stop::Refused(format!("{path}: {e}")))?;
                     let group = vyges_sta::liberty_parse::parse(&text).map_err(|e| Stop::Refused(format!("{path}: {e}")))?;
                     d.libs.push(Library::read(&group).map_err(|e| Stop::Refused(format!("{path}: {e} (not modelled)")))?);
+                    d.lib_paths.push(path.clone());
                 }
-                "define_corners" => return vyges_cts::log::refuse("define_corners: several scenes are not modelled"),
+                // Not a command at the pin (OpenSTA 3.0 scenes): `define_scene` is.
+                "define_corners" => return vyges_cts::log::refuse("define_corners: not a command at the pin (define_scene is)"),
+                "define_scene" => d.define_scene(&args)?,
+                "set_scene" => {
+                    let [name] = args.as_slice() else { return vyges_cts::log::refuse("set_scene: needs one scene name") };
+                    let Some(i) = d.scenes.iter().position(|(n, _)| n == name) else { return vyges_cts::log::refuse(format!("set_scene {name}: no such scene")) };
+                    d.cmd_scene = Some(i);
+                    d.scene_cmds.push((String::new(), vec![name.clone()]));
+
+                }
+                "set_wire_rc" | "set_layer_rc" if !d.scenes.is_empty() && args.iter().any(|a| a == "-corner") => {
+                    return vyges_cts::log::refuse(format!("{cmd} -corner with scenes defined (the command scene's wire RC): not modelled"));
+                }
                 "set_wire_rc" => {
                     d.rc.check_set_wire_rc(&d.db, &args).map_err(Stop::Refused)?;
                     d.rc.set_wire_rc(&d.db, units(&d.liberty).map_err(Stop::Refused)?, &args).map_err(Stop::Refused)?;
@@ -812,7 +948,7 @@ fn run(job: &Value) -> Result<Value, String> {
                     let s = if d.db.inst_names().is_empty() {
                         vyges_loom::sdc::Sdc::load(path)
                     } else {
-                        let libs = vyges_rsz::preamble::Libs { libs: d.libs.clone(), scenes: Vec::new(), scene_libs: Vec::new(), link_scene: None, ..Default::default() };
+                        let libs = d.rsz_libs();
                         vyges_loom::sdc::Sdc::load_with(path, &vyges_rsz::env::sdc_design(&d.db, &libs))
                     }
                     .map_err(|e| Stop::Refused(format!("{path}: {}", e.0)))?;
@@ -875,6 +1011,7 @@ fn run(job: &Value) -> Result<Value, String> {
                     d.clock_pattern = vyges_rsz::preamble::ClockPattern::from_settings(o.clock_buffer_string.as_deref(), o.clock_buffer_footprint.as_deref());
                 }
                 "clock_tree_synthesis" => {
+                    d.scenes_modelled()?;
                     // The command's own lines only: what the steps before it printed is kept apart.
                     pre.extend(log.take_lines());
                     return vyges_cts::run::clock_tree_synthesis(&mut o, &mut log, &mut d, &args).map(Some);
@@ -992,7 +1129,7 @@ const DESCRIBE: &str = r#"{
   "provenance_limitations": [
     "input_hash covers the argument vector, not the content of the job file or of the design files it names.",
     "status is one of done, up_to_date, vacuous, refused or error. done means the trees were built, written and reported; up_to_date means clock nets were looked for and none was found. A run that needs a stage not yet modelled (sink clustering, clock NDRs, clock-net repair, latency balancing of sub-trees) is refused, with modelled_through: htree when the trees were built but not written. The declared assertion passes on done and up_to_date. Exit status is 0 for done and up_to_date, 2 for vacuous and for error, 3 for refused.",
-    "Modelled: buffer list inference, root/sink/characterization buffer selection, clock-gate cloning, clock-net discovery through gaters and bidirect pads. Refused rather than guessed: hierarchical designs where a clone or register-tree buffer is made, insertion-delay (clock-tree-path) cells, several corners, set_disable_timing, case analysis and generated clocks."
+    "Modelled: buffer list inference, root/sink/characterization buffer selection, clock-gate cloning, clock-net discovery through gaters and bidirect pads. Refused rather than guessed: hierarchical designs where a clone or register-tree buffer is made, insertion-delay (clock-tree-path) cells, several scenes whose first scene is not the link library, set_disable_timing, case analysis and generated clocks."
   ],
   "invocation": {
     "args_template": ["clock_tree_synthesis", "{job}"],
@@ -1185,6 +1322,54 @@ mod tests {
         assert_eq!(read_liberty_text(a.to_str().unwrap()).unwrap(), "library (a) { }");
         assert_eq!(read_liberty_text(b.to_str().unwrap()).unwrap(), "library (b) { }");
         assert!(liberty_text(vec![0x1f, 0x8b, 0, 0]).is_err(), "a broken gzip stream is an error");
+    }
+
+    /// Upstream rule (TechChar, LatencyBalancer, `LibertyCell::timingArcSets` keyed by the link
+    /// cell's ports; witnessed on insertion_delay / inverters / post_cts_opt with Nangate45
+    /// slow/typ/fast scenes): clock_tree_synthesis runs on the FIRST scene's cells for timing
+    /// and characterisation and on the link cells (first library read) for everything else; the
+    /// command scene does not move it. Reading typ first but defining the slow scene first gives
+    /// a third tree, neither library's: that split is refused, not guessed.
+    #[test]
+    fn the_trees_are_the_first_scenes_and_a_split_from_the_link_library_is_refused() {
+        let lib = |name: &str, cells: &[&str]| {
+            let body: String = cells.iter().map(|c| format!("cell ({c}) {{ area : 1 ; }}\n")).collect();
+            Library::read(&vyges_sta::liberty_parse::parse(&format!("library ({name}) {{\n time_unit : \"1ns\" ;\n{body}}}\n")).unwrap()).unwrap()
+        };
+        let design = |order: &[(&str, &str)]| {
+            let mut d = CliDesign::empty();
+            for (path, name) in order {
+                d.libs.push(lib(name, if *name == "macro" { &["M"] } else { &["BUF", "INV"] }));
+                d.lib_paths.push(path.to_string());
+            }
+            d
+        };
+        let words = |s: &str| s.split(' ').map(str::to_string).collect::<Vec<_>>();
+        let scene = |d: &mut CliDesign, name: &str, libs: &str| d.define_scene(&[name.to_string(), "-liberty".into(), libs.to_string()]);
+        // read slow, typ, macro; scenes ss, tt: the first scene is the link library
+        let mut d = design(&[("s.lib", "slow"), ("t.lib", "typ"), ("m.lib", "macro")]);
+        scene(&mut d, "ss", "s.lib m.lib").unwrap();
+        scene(&mut d, "tt", "typ macro").unwrap();
+        assert_eq!(d.scenes, vec![("ss".to_string(), vec![0, 2]), ("tt".to_string(), vec![1, 2])]);
+        assert!(d.scenes_modelled().is_ok());
+        d.define_scene(&words("ff -liberty f.lib")).expect_err("a library never read");
+        // typ read first, slow scene defined first: refused
+        let mut d = design(&[("t.lib", "typ"), ("s.lib", "slow"), ("m.lib", "macro")]);
+        scene(&mut d, "ss", "s.lib m.lib").unwrap();
+        scene(&mut d, "tt", "t.lib m.lib").unwrap();
+        assert!(d.scenes_modelled().is_err());
+        // the same reads, the typ scene first (whatever the command scene): modelled
+        let mut d = design(&[("t.lib", "typ"), ("s.lib", "slow"), ("m.lib", "macro")]);
+        scene(&mut d, "tt", "t.lib m.lib").unwrap();
+        scene(&mut d, "ss", "s.lib m.lib").unwrap();
+        d.cmd_scene = Some(1);
+        assert!(d.scenes_modelled().is_ok());
+        // one library in every scene (several modes): modelled
+        let mut d = design(&[("t.lib", "typ")]);
+        for m in ["func", "test"] {
+            d.define_scene(&words(&format!("scene_{m} -mode {m} -liberty typ"))).unwrap();
+        }
+        assert!(d.scenes_modelled().is_ok());
     }
 
     // Rule (vacuous convention): only a checked nothing-to-do exits 0; a refusal never does.
