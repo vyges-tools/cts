@@ -628,9 +628,10 @@ impl CliDesign {
         }
         let libs = self.rsz_libs();
         let lib0 = libs.default_library().ok_or_else(|| Stop::Refused("no liberty library".into()))?;
-        if lib0.time_scale != 1e-9f32 {
-            return vyges_cts::log::refuse("a library time unit other than 1ns: not modelled");
-        }
+        // Any library time unit: the limits are converted from user units at the boundary
+        // (`user_time_to_sta` with the default library's scale), and repairClkNets repairs wire
+        // length only. Witnessed: the reference gives a byte-identical tree on a library rescaled
+        // to 1ps, and ours matches it.
         let limits = vyges_rsz::timing::Limits {
             design_max_transition: s.max_transition.map(|v| vyges_rsz::timing::user_time_to_sta(v, lib0.time_scale)),
             design_max_fanout: s.max_fanout.map(|v| v as f32),
