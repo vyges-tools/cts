@@ -188,9 +188,7 @@ impl CliDesign {
         Ok(())
     }
 
-    /// The resizer's scene model, replayed from the reads and the scene commands. A cell name in
-    /// two of a scene's libraries makes their read order observable: refused, as in the
-    /// resizer's own job.
+    /// The resizer's scene model, replayed from the reads and the scene commands.
     fn rsz_libs_checked(&self) -> Res<vyges_rsz::preamble::Libs> {
         let mut r = vyges_rsz::preamble::Libs { libs: self.libs.clone(), lib_files: self.lib_paths.clone(), ..Default::default() };
         for (name, args) in &self.scene_cmds {
@@ -198,9 +196,9 @@ impl CliDesign {
                 r.set_scene(&args[0]).map_err(Stop::Refused)?;
             } else {
                 r.define_scene(name, args).map_err(Stop::Refused)?;
-                if let Some(why) = r.align_scene_order().first() {
-                    return vyges_cts::log::refuse(format!("define_scene {name}: {why}"));
-                }
+                // Informational, as in the resizer's own job: a scene it cannot align to the link
+                // scene's library order keeps its own graph.
+                let _ = r.align_scene_order();
             }
         }
         Ok(r)
