@@ -563,24 +563,36 @@ impl CliDesign {
         let named = std::mem::take(&mut s.propagated);
         // `[all_inputs]` / `[all_outputs]` delays as the ports they name (the search reads ports).
         vyges_rsz::env::expand_io_delay_ports(&mut s, &netlist);
+        // `VYGES_CTS_STAGES`: each step's wall time, one line
+        let stages = std::env::var_os("VYGES_CTS_STAGES").is_some();
+        let t0 = std::time::Instant::now();
+        let mut marks: Vec<(&str, u128)> = Vec::new();
+        let mut mark = |name: &'static str| marks.push((name, t0.elapsed().as_millis()));
         let r = (|| -> Result<HashMap<String, Vec<(f32, String)>>, String> {
             let clock_sources: Vec<String> = s.clocks.iter().filter(|c| !c.is_virtual()).flat_map(|c| c.sources.iter().cloned()).collect();
             let mut rc = self.rc.clone();
             rc.sort_clk_and_signal_layers();
             let caps = port_caps_at(None, Some(&s), &libs, &netlist)?;
             let par = placement_parasitics_at(&self.db, &rc, &self.liberty, &clock_sources, true, 0.3, 1, &caps)?;
+            mark("parasitics");
             let mut env = sdc_env(&s, &libs, &netlist)?;
             env.constants = sim_constants_sdc(&self.db, &self.liberty, Some(&s))?;
             let mpins = master_pins(&self.db)?;
             let mut g = vyges_rsz::repair_design::timer_graph(&libs, 0, &netlist, &env, &mpins).map_err(|e| e.message().to_string())?;
+            mark("graph");
             g.find_delays(&par[0], None)?;
+            mark("delays");
             let time_scale = libs.default_library().ok_or("no liberty library")?.time_scale;
             // `setAllClocksPropagated` after the constraints were read: every real clock
             // propagated (its network latency removed), virtual clocks kept ideal with theirs;
             // the constraints as the mode's timer reads them (uncertainties, exceptions, groups).
             let ssdc = vyges_sta::scenes::mode_search_sdc(&s, &netlist, time_scale, true)?;
             let mut search = vyges_sta::search::Search::in_graph_order(&g, &ssdc);
-            search.find_arrivals()?;
+            // `ensureClkArrivals` ("Only clock arrivals at the sinks are read; data arrivals are
+            // not"): the clock network searched alone, to the register clock pins
+            // (`Search::findClkArrivals`); a sink's paths are the full search's.
+            search.find_clk_arrivals()?;
+            mark("arrivals");
             let mut out: HashMap<String, Vec<(f32, String)>> = HashMap::new();
             for v in 0..g.vertices.len() {
                 for p in &search.paths[v] {
@@ -601,8 +613,12 @@ impl CliDesign {
                     out.entry(g.vname(v)).or_default().push((p.arrival, net));
                 }
             }
+            mark("table");
             Ok(out)
         })();
+        if stages {
+            eprintln!("VYGCTS|clock_arrival_table|{}", marks.iter().map(|(n, ms)| format!("{n}={ms}")).collect::<Vec<_>>().join("|"));
+        }
         s.propagated = named;
         self.sdc = Some(s);
         r
