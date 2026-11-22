@@ -554,7 +554,7 @@ impl CliDesign {
     /// each max path of a rising clock edge (in the search's order) and the net its clock path
     /// starts on.
     fn clock_arrival_table(&mut self) -> Result<HashMap<String, Vec<(f32, String)>>, String> {
-        use vyges_rsz::env::{master_pins, placement_parasitics_at, port_caps_at, sdc_env, sim_constants};
+        use vyges_rsz::env::{master_pins, placement_parasitics_at, port_caps_at, sdc_env, sim_constants_sdc};
         if self.routing_alpha_set {
             return Err("set_routing_alpha before the latency balancer's parasitics: not modelled".into());
         }
@@ -572,7 +572,7 @@ impl CliDesign {
             let caps = port_caps_at(None, Some(&s), &libs, &netlist)?;
             let par = placement_parasitics_at(&self.db, &rc, &self.liberty, &clock_sources, true, 0.3, 1, &caps)?;
             let mut env = sdc_env(&s, &libs, &netlist)?;
-            env.constants = sim_constants(&self.db, &self.liberty)?;
+            env.constants = sim_constants_sdc(&self.db, &self.liberty, Some(&s))?;
             let mpins = master_pins(&self.db)?;
             let mut g = vyges_rsz::repair_design::timer_graph(&libs, 0, &netlist, &env, &mpins).map_err(|e| e.message().to_string())?;
             g.find_delays(&par[0], None)?;
@@ -955,10 +955,24 @@ fn run(job: &Value) -> Result<Value, String> {
                     if let Some(q) = s.unevaluated_queries.first() {
                         return vyges_cts::log::refuse(format!("{path}: {q}: object query not evaluated, not modelled"));
                     }
-                    for c in ["set_disable_timing", "set_case_analysis", "create_generated_clock"] {
+                    for c in ["set_disable_timing", "create_generated_clock"] {
                         if s.ignored.iter().any(|i| i == c) {
                             return vyges_cts::log::refuse(format!("{path}: {c} (the clock network it changes) is not modelled"));
                         }
+                    }
+                    // `set_case_analysis` / `set_logic_*`: the mode's simulation constants. TritonCTS
+                    // reads no constant itself: clock nets come from `findClkNets` (`ClkTreeSearchPred`
+                    // tests disabled constraints, never a constant) and its own pin walks; the latency
+                    // balancer's arrivals do see them (the search skips constant vertices), so the
+                    // arrival table takes them. A constant landing on a clock net is refused (the
+                    // resizer's rule for its own clock-pin walks).
+                    if !s.case_values.is_empty() || !s.logic_values.is_empty() {
+                        use vyges_rsz::env::{constant_values_sdc, constants_off_clock_networks, sdc_constraints};
+                        let refused = |e: String| Stop::Refused(format!("{path}: {e}"));
+                        let c = sdc_constraints(&s, &d.db).map_err(refused)?;
+                        let with = constant_values_sdc(&d.db, &d.liberty, Some(&s)).map_err(refused)?;
+                        let sources: Vec<String> = s.clocks.iter().filter(|c| !c.is_virtual()).flat_map(|c| c.sources.iter().cloned()).collect();
+                        constants_off_clock_networks(&d.db, &d.liberty, &sources, &c, &with).map_err(refused)?;
                     }
                     // `set_max_fanout V [current_design]` is the design's limit (read); on any other
                     // object it is not modelled.
@@ -1129,7 +1143,7 @@ const DESCRIBE: &str = r#"{
   "provenance_limitations": [
     "input_hash covers the argument vector, not the content of the job file or of the design files it names.",
     "status is one of done, up_to_date, vacuous, refused or error. done means the trees were built, written and reported; up_to_date means clock nets were looked for and none was found. A run that needs a stage not yet modelled (sink clustering, clock NDRs, clock-net repair, latency balancing of sub-trees) is refused, with modelled_through: htree when the trees were built but not written. The declared assertion passes on done and up_to_date. Exit status is 0 for done and up_to_date, 2 for vacuous and for error, 3 for refused.",
-    "Modelled: buffer list inference, root/sink/characterization buffer selection, clock-gate cloning, clock-net discovery through gaters and bidirect pads. Refused rather than guessed: hierarchical designs where a clone or register-tree buffer is made, insertion-delay (clock-tree-path) cells, several scenes whose first scene is not the link library, set_disable_timing, case analysis and generated clocks."
+    "Modelled: buffer list inference, root/sink/characterization buffer selection, clock-gate cloning, clock-net discovery through gaters and bidirect pads. Refused rather than guessed: hierarchical designs where a clone or register-tree buffer is made, insertion-delay (clock-tree-path) cells, several scenes whose first scene is not the link library, set_disable_timing, a case-analysis constant on a clock net and generated clocks."
   ],
   "invocation": {
     "args_template": ["clock_tree_synthesis", "{job}"],
