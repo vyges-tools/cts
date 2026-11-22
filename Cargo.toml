@@ -17,17 +17,17 @@ cli = ["dep:vyges-opendb", "dep:vyges-est", "dep:vyges-loom", "dep:vyges-rsz", "
 
 [dependencies]
 # The timer's library model: cells, ports, arcs.
-vyges-sta = { git = "https://github.com/vyges-tools/sta.git", branch = "repin-f11b4276" }
+vyges-sta = { git = "https://github.com/vyges-tools/sta.git", branch = "main" }
 # The Steiner trees clock-gate cloning reads.
 vyges-stt = { git = "https://github.com/vyges-tools/stt.git", branch = "main" }
 # The suite's logger: the run's lines in the reference's format, each also an event (the CLI's
 # events trail).
 vyges-events = { git = "https://github.com/vyges-tools/events.git", branch = "main", default-features = false }
-vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "repin-f11b4276", optional = true }
-vyges-est = { git = "https://github.com/vyges-tools/est.git", branch = "repin-f11b4276", features = ["odb"], optional = true }
-vyges-loom = { git = "https://github.com/vyges-tools/loom.git", branch = "repin-f11b4276", optional = true }
+vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "main", optional = true }
+vyges-est = { git = "https://github.com/vyges-tools/est.git", branch = "main", features = ["odb"], optional = true }
+vyges-loom = { git = "https://github.com/vyges-tools/loom.git", branch = "main", optional = true }
 # The resizer's buffers and max wire length (cloning's threshold).
-vyges-rsz = { git = "https://github.com/vyges-tools/rsz.git", branch = "repin-f11b4276", optional = true }
+vyges-rsz = { git = "https://github.com/vyges-tools/rsz.git", branch = "main", optional = true }
 # The timer adapter (the netlist the timer reads from the database): the latency balancer's clock
 # arrivals on the written trees.
 vyges-grt = { git = "https://github.com/vyges-tools/grt.git", branch = "main", default-features = false, features = ["odb"], optional = true }
