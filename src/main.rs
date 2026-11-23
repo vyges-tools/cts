@@ -143,11 +143,15 @@ struct CliDesign {
     /// current) and the simulation's constants, for the latency balancer while the design is as
     /// the repair left it ([`CliDesign::refresh`] lets it go).
     held_timing: Option<HeldTiming>,
+    /// The SDC (its path) whose `set_case_analysis` / `set_logic_*` values are not yet checked
+    /// against the clock network: checked when first needed, not at `read_sdc`
+    /// ([`CliDesign::check_constants_off_clock`]).
+    constant_check: Option<String>,
 }
 
 impl CliDesign {
     fn empty() -> CliDesign {
-        CliDesign { db: Db::new(), libs: Vec::new(), lib_paths: Vec::new(), scenes: Vec::new(), cmd_scene: None, scene_cmds: Vec::new(), rc: vyges_est::rc::Rc::new(), tech: String::new(), clocks: Vec::new(), modes: Vec::new(), cur_mode: None, dont_use: BTreeSet::new(), set_dont_use: BTreeSet::new(), routing_alpha_set: false, clock_pattern: Default::default(), masters: HashSet::new(), net_ids: HashMap::new(), bterms: HashSet::new(), sdc_max_fanout: false, default_fanout: FanoutLimits::default(), mode_fanout: Vec::new(), liberty: vyges_est::liberty::LibertyClocks::default(), sdc: None, clock_arrivals: None, held_timing: None }
+        CliDesign { db: Db::new(), libs: Vec::new(), lib_paths: Vec::new(), scenes: Vec::new(), cmd_scene: None, scene_cmds: Vec::new(), rc: vyges_est::rc::Rc::new(), tech: String::new(), clocks: Vec::new(), modes: Vec::new(), cur_mode: None, dont_use: BTreeSet::new(), set_dont_use: BTreeSet::new(), routing_alpha_set: false, clock_pattern: Default::default(), masters: HashSet::new(), net_ids: HashMap::new(), bterms: HashSet::new(), sdc_max_fanout: false, default_fanout: FanoutLimits::default(), mode_fanout: Vec::new(), liberty: vyges_est::liberty::LibertyClocks::default(), sdc: None, clock_arrivals: None, held_timing: None, constant_check: None }
     }
 
     /// `define_scene name [-mode m] -liberty {libs}`: a scene of libraries already read, named by
@@ -250,6 +254,26 @@ impl CliDesign {
             }
         }
         Ok(())
+    }
+
+    /// The deferred constant-on-clock check of the constraints as read (see `constant_check`).
+    /// Reference rule (OpenSTA): `set_case_analysis` / `set_logic_*` only record the value; the
+    /// simulation runs when a search first needs it (`Sim` is computed once per netlist state,
+    /// `ensureConstantsPropagated`), so `read_sdc` simulates nothing. Ours ran two simulations and a
+    /// clock walk at `read_sdc` and the repair setup ran them again after the trees. The check now
+    /// runs once: in the repair setup (on its shared simulation and walk), else before the
+    /// latency balancer's arrivals, else before the command's result is reported, and for
+    /// constraints a later `read_sdc` replaces. A constant that reaches a clock net before the
+    /// trees reaches one after them (the tree's buffers carry it), so the refusals are the same.
+    fn check_constants_off_clock(&mut self) -> Res<()> {
+        let Some(path) = self.constant_check.take() else { return Ok(()) };
+        let Some(s) = self.sdc.as_ref() else { return Ok(()) };
+        use vyges_rsz::env::{constant_values_sdc, constants_off_clock_networks, sdc_constraints};
+        let refused = |e: String| Stop::Refused(format!("{path}: {e}"));
+        let c = sdc_constraints(s, &self.db).map_err(refused)?;
+        let with = constant_values_sdc(&self.db, &self.liberty, Some(s)).map_err(refused)?;
+        let sources: Vec<String> = s.clocks.iter().filter(|c| !c.is_virtual()).flat_map(|c| c.sources.iter().cloned()).collect();
+        constants_off_clock_networks(&self.db, &self.liberty, &sources, &c, &with).map_err(refused)
     }
 
     fn refresh(&mut self) {
@@ -561,6 +585,11 @@ impl CliDesign {
         if self.routing_alpha_set {
             return Err("set_routing_alpha before the latency balancer's parasitics: not modelled".into());
         }
+        // read_sdc's deferred constant-on-clock check, when no repair ran it
+        self.check_constants_off_clock().map_err(|e| match e {
+            Stop::Refused(why) => why,
+            Stop::Error { tool, id } => format!("{tool}-{id:04}"),
+        })?;
         let libs = self.rsz_libs();
         let netlist = vyges_grt::timer::netlist(&self.db);
         let mut s = self.sdc.take().ok_or("the latency balancer without constraints: not modelled")?;
@@ -714,6 +743,8 @@ impl CliDesign {
             vyges_est::sim::constant_pins_constrained(&self.db, &self.liberty, &constraints).map_err(|e| refused(format!("constant propagation: {e}")))?
         };
         constants_off_clock_networks_given(&self.db, base_skips.clock_nets(), &constraints, &constant_values, &without).map_err(refused)?;
+        // read_sdc's deferred check is this one (the same constraints, this design state)
+        self.constant_check = None;
         // the resizer's held skips (its `fresh_skips`: these constants, the same clock walk)
         let held_skips = base_skips.with_constants(&constant_values, &timing);
         drop(timing);
@@ -1018,6 +1049,9 @@ fn run(job: &Value) -> Result<Value, String> {
                 }
                 "read_sdc" => {
                     let path = args.last().ok_or_else(|| Stop::Refused("read_sdc path".into()))?;
+                    // The constraints this read replaces are checked now, on the design they were
+                    // read against (nothing later reads them).
+                    d.check_constants_off_clock()?;
                     // Read against the linked design, as the reference does: object queries select
                     // from the database's ports, instances and pins.
                     let s = if d.db.inst_names().is_empty() {
@@ -1040,15 +1074,9 @@ fn run(job: &Value) -> Result<Value, String> {
                     // tests disabled constraints, never a constant) and its own pin walks; the latency
                     // balancer's arrivals do see them (the search skips constant vertices), so the
                     // arrival table takes them. A constant landing on a clock net is refused (the
-                    // resizer's rule for its own clock-pin walks).
-                    if !s.case_values.is_empty() || !s.logic_values.is_empty() {
-                        use vyges_rsz::env::{constant_values_sdc, constants_off_clock_networks, sdc_constraints};
-                        let refused = |e: String| Stop::Refused(format!("{path}: {e}"));
-                        let c = sdc_constraints(&s, &d.db).map_err(refused)?;
-                        let with = constant_values_sdc(&d.db, &d.liberty, Some(&s)).map_err(refused)?;
-                        let sources: Vec<String> = s.clocks.iter().filter(|c| !c.is_virtual()).flat_map(|c| c.sources.iter().cloned()).collect();
-                        constants_off_clock_networks(&d.db, &d.liberty, &sources, &c, &with).map_err(refused)?;
-                    }
+                    // resizer's rule for its own clock-pin walks) — checked when first needed, not
+                    // here (`check_constants_off_clock`).
+                    d.constant_check = (!s.case_values.is_empty() || !s.logic_values.is_empty()).then(|| path.clone());
                     // `set_max_fanout V [current_design]` is the design's limit (read); on any other
                     // object it is not modelled.
                     d.sdc_max_fanout = s.max_fanout_on_objects;
@@ -1109,6 +1137,12 @@ fn run(job: &Value) -> Result<Value, String> {
             }
             Ok(None)
         })();
+        // read_sdc's deferred constant-on-clock check, when nothing in the command ran it: before
+        // any result is reported or written
+        let r = match r {
+            Ok(None) | Err(Stop::Refused(_)) => r,
+            _ => d.check_constants_off_clock().and(r),
+        };
         match r {
             Ok(None) => {}
             // No clock net: the command's whole output, nothing to build — checked (clock_nets 0).
@@ -1145,6 +1179,9 @@ fn run(job: &Value) -> Result<Value, String> {
             }
             Err(Stop::Refused(why)) => return Ok(finish(log, &pre, "refused", Some(why))),
         }
+    }
+    if let Err(Stop::Refused(why)) = d.check_constants_off_clock() {
+        return Ok(finish(log, &pre, "refused", Some(why)));
     }
     // No clock_tree_synthesis step: nothing was checked.
     Ok(finish(log, &pre, "vacuous", Some("the job has no clock_tree_synthesis step".into())))
@@ -1462,6 +1499,25 @@ mod tests {
     }
 
     // Rule (vacuous convention): only a checked nothing-to-do exits 0; a refusal never does.
+    /// Reference rule (OpenSTA): `read_sdc`'s `set_case_analysis` / `set_logic_*` only record the
+    /// value and the simulation runs when a search first needs it, once per netlist state. Ours
+    /// defers the constant-on-clock check the same way: `read_sdc` leaves it pending, the first
+    /// consumer runs it once and a second ask runs nothing.
+    #[test]
+    fn the_constant_on_clock_check_is_deferred_and_runs_once() {
+        let mut d = CliDesign::empty();
+        d.sdc = Some(vyges_loom::sdc::Sdc::default());
+        assert!(d.check_constants_off_clock().is_ok(), "nothing pending: nothing checked");
+        d.constant_check = Some("c.sdc".into());
+        assert!(d.check_constants_off_clock().is_ok(), "no clock source: no clock net to reach");
+        assert_eq!(d.constant_check, None, "the check is taken by its first consumer");
+        // a pending check without constraints (nothing read since) is dropped, not an error
+        d.sdc = None;
+        d.constant_check = Some("c.sdc".into());
+        assert!(d.check_constants_off_clock().is_ok());
+        assert_eq!(d.constant_check, None);
+    }
+
     #[test]
     fn only_done_and_up_to_date_exit_zero() {
         assert_eq!(exit_for("done"), 0);
