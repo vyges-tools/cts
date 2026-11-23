@@ -736,7 +736,7 @@ impl vyges_cts::techchar::CharDesign for CliDesign {
 impl CliDesign {
     /// `Resizer::repairClkNets` on the written design, with the constraints as read.
     fn repair_clk_nets_with(&mut self, s: &vyges_loom::sdc::Sdc, log: &mut Log, clk_buffers: &[String], max_wire_length: f64, balancer_follows: bool) -> Res<()> {
-        use vyges_rsz::env::{constant_values, constants_by_name, constants_off_clock_networks_given, master_pins, no_signal_cap, placement_parasitics_held, port_caps_at, sdc_constraints, sdc_env};
+        use vyges_rsz::env::{constant_values, constants_by_name, constants_off_clock_networks_given, master_pins, no_signal_cap, placement_parasitics_held_scenes, port_caps_at, sdc_constraints, sdc_env};
         use vyges_rsz::odb_design::{net_info, sdc_cap_pins, sdc_port_cap_limits, sizing_limits, CliDesign as RszDesign};
         let refused = |e: String| Stop::Refused(format!("repair_clock_nets: {e}"));
         if self.routing_alpha_set {
@@ -785,11 +785,22 @@ impl CliDesign {
         // three (`ensureConstantsPropagated` / `ensureClkNetwork` are cached checks). Each of ours
         // ran its own: five simulations and three walks before the first repair.
         let timing = vyges_est::placement::Timing { liberty: Some(&self.liberty), clock_sources: clock_sources.clone(), propagated: true };
-        let without = constant_values(&self.db, &self.liberty).map_err(refused)?;
+        // As the resizer's own repair_clock_nets: the SDC's constraint values (`set_case_analysis`,
+        // `set_logic_*`) seed the simulation's constants, and none may reach a clock network.
+        // The constraints are read here, their refusal reported where it always was (below); with
+        // any constraint value, both simulations run on one read of the design.
+        let constraints = sdc_constraints(s, &self.db);
+        let (without, with) = match &constraints {
+            Ok(c) if !(c.case.is_empty() && c.logic.is_empty()) => {
+                let (a, b) = vyges_est::sim::constant_pins_without_and_with(&self.db, &self.liberty, c).map_err(|e| refused(format!("constant propagation: {e}")))?;
+                (a, Some(b))
+            }
+            _ => (constant_values(&self.db, &self.liberty).map_err(refused)?, None),
+        };
         vyges_rsz::stage("rcn_sim");
         let base_skips = vyges_est::placement::skips_with_constants(&self.db, &timing, &without).map_err(|e| refused(e.to_string()))?;
         vyges_rsz::stage("rcn_clock_walk");
-        let parasitics = placement_parasitics_held(&self.db, &rc, &self.liberty, &clock_sources, true, 0.3, libs.scene_count(), &caps, Some(&base_skips)).map_err(refused)?;
+        let parasitics = placement_parasitics_held_scenes(&self.db, &rc, &self.liberty, &clock_sources, true, 0.3, libs.scene_count(), &caps, Some(&base_skips)).map_err(refused)?;
         vyges_rsz::stage("rcn_estimate");
         let wire_rc: Vec<vyges_rsz::buffered_net::WireRc> = (0..libs.scene_count().max(1))
             .map(|k| {
@@ -797,15 +808,9 @@ impl CliDesign {
                 vyges_rsz::buffered_net::WireRc { h_res: v[0], v_res: v[1], h_cap: v[2], v_cap: v[3] }
             })
             .collect();
-        // As the resizer's own repair_clock_nets: the SDC's constraint values (`set_case_analysis`,
-        // `set_logic_*`) seed the simulation's constants, and none may reach a clock network.
-        let constraints = sdc_constraints(s, &self.db).map_err(refused)?;
+        let constraints = constraints.map_err(refused)?;
         // `constant_values_sdc`: the design's own constants when no constraint value is set
-        let constant_values = if constraints.case.is_empty() && constraints.logic.is_empty() {
-            without.clone()
-        } else {
-            vyges_est::sim::constant_pins_constrained(&self.db, &self.liberty, &constraints).map_err(|e| refused(format!("constant propagation: {e}")))?
-        };
+        let constant_values = with.unwrap_or_else(|| without.clone());
         constants_off_clock_networks_given(&self.db, base_skips.clock_nets(), &constraints, &constant_values, &without).map_err(refused)?;
         // read_sdc's deferred check is this one (the same constraints, this design state)
         self.constant_check = None;
@@ -878,7 +883,7 @@ impl CliDesign {
                         ok &= design.ensure_wire_parasitic(n).is_ok();
                     }
                     vyges_rsz::stage("rcn_held_estimate");
-                    ok.then(|| HeldTiming { parasitics: std::mem::take(&mut design.parasitics[0]), constants: design.constants.clone() })
+                    ok.then(|| HeldTiming { parasitics: std::mem::take(&mut design.parasitics).into_scene(0), constants: design.constants.clone() })
                 }
                 _ => None,
             };
