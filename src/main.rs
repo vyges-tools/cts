@@ -139,11 +139,15 @@ struct CliDesign {
     /// The clock arrivals on the written design (timed when first asked): per pin, each max path of
     /// a rising clock edge in the search's order, with the net its clock path starts on.
     clock_arrivals: Option<HashMap<String, Vec<(f32, String)>>>,
+    /// The timer state `repair_clock_nets` left: the first scene's placement parasitics (every net
+    /// current) and the simulation's constants, for the latency balancer while the design is as
+    /// the repair left it ([`CliDesign::refresh`] lets it go).
+    held_timing: Option<HeldTiming>,
 }
 
 impl CliDesign {
     fn empty() -> CliDesign {
-        CliDesign { db: Db::new(), libs: Vec::new(), lib_paths: Vec::new(), scenes: Vec::new(), cmd_scene: None, scene_cmds: Vec::new(), rc: vyges_est::rc::Rc::new(), tech: String::new(), clocks: Vec::new(), modes: Vec::new(), cur_mode: None, dont_use: BTreeSet::new(), set_dont_use: BTreeSet::new(), routing_alpha_set: false, clock_pattern: Default::default(), masters: HashSet::new(), net_ids: HashMap::new(), bterms: HashSet::new(), sdc_max_fanout: false, default_fanout: FanoutLimits::default(), mode_fanout: Vec::new(), liberty: vyges_est::liberty::LibertyClocks::default(), sdc: None, clock_arrivals: None }
+        CliDesign { db: Db::new(), libs: Vec::new(), lib_paths: Vec::new(), scenes: Vec::new(), cmd_scene: None, scene_cmds: Vec::new(), rc: vyges_est::rc::Rc::new(), tech: String::new(), clocks: Vec::new(), modes: Vec::new(), cur_mode: None, dont_use: BTreeSet::new(), set_dont_use: BTreeSet::new(), routing_alpha_set: false, clock_pattern: Default::default(), masters: HashSet::new(), net_ids: HashMap::new(), bterms: HashSet::new(), sdc_max_fanout: false, default_fanout: FanoutLimits::default(), mode_fanout: Vec::new(), liberty: vyges_est::liberty::LibertyClocks::default(), sdc: None, clock_arrivals: None, held_timing: None }
     }
 
     /// `define_scene name [-mode m] -liberty {libs}`: a scene of libraries already read, named by
@@ -249,6 +253,7 @@ impl CliDesign {
     }
 
     fn refresh(&mut self) {
+        self.held_timing = None;
         self.masters = (0..self.db.num_masters().unwrap_or(0)).filter_map(|i| self.db.nth_master_name(i).ok()).collect();
         self.net_ids = self.db.block_get_nets().into_iter().enumerate().map(|(i, n)| (n, i as u32)).collect();
         self.bterms = self.db.block_get_b_terms().into_iter().collect();
@@ -572,15 +577,35 @@ impl CliDesign {
             let clock_sources: Vec<String> = s.clocks.iter().filter(|c| !c.is_virtual()).flat_map(|c| c.sources.iter().cloned()).collect();
             let mut rc = self.rc.clone();
             rc.sort_clk_and_signal_layers();
-            let caps = port_caps_at(None, Some(&s), &libs, &netlist)?;
-            let par = placement_parasitics_at(&self.db, &rc, &self.liberty, &clock_sources, true, 0.3, 1, &caps)?;
+            // 🔑 The timer the repair left, when the design is still as it left it: the reference's
+            // balancer reads the one `Sta` that `repairClkNets` just updated (`initSta` estimates
+            // and simulates nothing), so neither is made again here. Reference rule (OpenROAD
+            // `LatencyBalancer::initSta`: `ensureGraph`, `ensureClkNetwork`, `ensureClkArrivals`
+            // only). `VYGES_CTS_FRESH_BALANCER` estimates and simulates afresh;
+            // `VYGES_CTS_CHECK_HELD` compares the held state with a fresh one.
+            let held = self.held_timing.take();
+            let fresh = |db: &Db| -> Result<FreshTiming, String> {
+                let caps = port_caps_at(None, Some(&s), &libs, &netlist)?;
+                let mut par = placement_parasitics_at(db, &rc, &self.liberty, &clock_sources, true, 0.3, 1, &caps)?;
+                Ok((std::mem::take(&mut par[0]), sim_constants_sdc(db, &self.liberty, Some(&s))?))
+            };
+            let (par0, constants) = match held {
+                Some(h) => {
+                    if std::env::var_os("VYGES_CTS_CHECK_HELD").is_some() {
+                        let (fp, fc) = fresh(&self.db)?;
+                        check_held(&h, &fp, &fc)?;
+                    }
+                    (h.parasitics, h.constants)
+                }
+                None => fresh(&self.db)?,
+            };
             mark("parasitics");
             let mut env = sdc_env(&s, &libs, &netlist)?;
-            env.constants = sim_constants_sdc(&self.db, &self.liberty, Some(&s))?;
+            env.constants = constants;
             let mpins = master_pins(&self.db)?;
             let mut g = vyges_rsz::repair_design::timer_graph(&libs, 0, &netlist, &env, &mpins).map_err(|e| e.message().to_string())?;
             mark("graph");
-            g.find_delays(&par[0], None)?;
+            g.find_delays(&par0, None)?;
             mark("delays");
             let time_scale = libs.default_library().ok_or("no liberty library")?.time_scale;
             // `setAllClocksPropagated` after the constraints were read: every real clock
@@ -634,7 +659,7 @@ impl vyges_cts::techchar::CharDesign for CliDesign {
 impl CliDesign {
     /// `Resizer::repairClkNets` on the written design, with the constraints as read.
     fn repair_clk_nets_with(&mut self, s: &vyges_loom::sdc::Sdc, log: &mut Log, clk_buffers: &[String], max_wire_length: f64) -> Res<()> {
-        use vyges_rsz::env::{constant_values_sdc, constants_by_name, constants_off_clock_networks, master_pins, no_signal_cap, placement_parasitics_at, port_caps_at, sdc_constraints, sdc_env};
+        use vyges_rsz::env::{constant_values, constants_by_name, constants_off_clock_networks_given, master_pins, no_signal_cap, placement_parasitics_held, port_caps_at, sdc_constraints, sdc_env};
         use vyges_rsz::odb_design::{net_info, sdc_cap_pins, sdc_port_cap_limits, sizing_limits, CliDesign as RszDesign};
         let refused = |e: String| Stop::Refused(format!("repair_clock_nets: {e}"));
         if self.routing_alpha_set {
@@ -664,7 +689,15 @@ impl CliDesign {
         let mut rc = self.rc.clone();
         rc.sort_clk_and_signal_layers();
         let caps = port_caps_at(None, Some(s), &libs, &netlist).map_err(refused)?;
-        let parasitics = placement_parasitics_at(&self.db, &rc, &self.liberty, &clock_sources, true, 0.3, libs.scene_count(), &caps).map_err(refused)?;
+        // 🔑 ONE logic simulation per constraint set and ONE clock-network walk for this design
+        // state, shared by the estimate's skips, the constants-off-clock check and the resizer's
+        // held skips — the reference's `Sim` and `ClkNetwork` are computed once and read by all
+        // three (`ensureConstantsPropagated` / `ensureClkNetwork` are cached checks). Each of ours
+        // ran its own: five simulations and three walks before the first repair.
+        let timing = vyges_est::placement::Timing { liberty: Some(&self.liberty), clock_sources: clock_sources.clone(), propagated: true };
+        let without = constant_values(&self.db, &self.liberty).map_err(refused)?;
+        let base_skips = vyges_est::placement::skips_with_constants(&self.db, &timing, &without).map_err(|e| refused(e.to_string()))?;
+        let parasitics = placement_parasitics_held(&self.db, &rc, &self.liberty, &clock_sources, true, 0.3, libs.scene_count(), &caps, Some(&base_skips)).map_err(refused)?;
         let wire_rc: Vec<vyges_rsz::buffered_net::WireRc> = (0..libs.scene_count().max(1))
             .map(|k| {
                 let v = rc.resolved(&self.tech, k);
@@ -674,8 +707,16 @@ impl CliDesign {
         // As the resizer's own repair_clock_nets: the SDC's constraint values (`set_case_analysis`,
         // `set_logic_*`) seed the simulation's constants, and none may reach a clock network.
         let constraints = sdc_constraints(s, &self.db).map_err(refused)?;
-        let constant_values = constant_values_sdc(&self.db, &self.liberty, Some(s)).map_err(refused)?;
-        constants_off_clock_networks(&self.db, &self.liberty, &clock_sources, &constraints, &constant_values).map_err(refused)?;
+        // `constant_values_sdc`: the design's own constants when no constraint value is set
+        let constant_values = if constraints.case.is_empty() && constraints.logic.is_empty() {
+            without.clone()
+        } else {
+            vyges_est::sim::constant_pins_constrained(&self.db, &self.liberty, &constraints).map_err(|e| refused(format!("constant propagation: {e}")))?
+        };
+        constants_off_clock_networks_given(&self.db, base_skips.clock_nets(), &constraints, &constant_values, &without).map_err(refused)?;
+        // the resizer's held skips (its `fresh_skips`: these constants, the same clock walk)
+        let held_skips = base_skips.with_constants(&constant_values, &timing);
+        drop(timing);
         let constants = constants_by_name(constant_values);
         let mut env = sdc_env(s, &libs, &netlist).map_err(refused)?;
         env.constants = constants.clone();
@@ -706,17 +747,36 @@ impl CliDesign {
         };
         let liberty = self.liberty.clone();
         let mut trace = vyges_rsz::trace::Trace::default();
-        let r = {
+        let (r, held) = {
             let mut design = RszDesign { constants, constraints, estimating, core, port_caps, propagated: true, sdc_pins: sdc_cap_pins(s), ..RszDesign::new(&mut self.db, &rc, &liberty, &libs, &clock_sources, netlist, parasitics, info) };
+            if std::env::var_os("VYGES_CTS_FRESH_SKIPS").is_none() {
+                design.hold_skips(held_skips).map_err(refused)?;
+            }
             let inputs = vyges_rsz::repair_design::Inputs { libs: &libs, masters: &masters, dont_use: &dont_use, limits, clock_sources: &clock_sources, dbu, wire_rc, sdc: env, master_pins: mpins, sizing_limits: block_limits, clock_pattern: self.clock_pattern.clone() };
             let order = |p: &str| ids.get(p).copied().unwrap_or(u64::MAX);
-            vyges_rsz::repair_design::repair_clk_nets(&inputs, &mut design, clk_buffers, &clocks, &order, max_wire_length, &mut trace)
+            let r = vyges_rsz::repair_design::repair_clk_nets(&inputs, &mut design, clk_buffers, &clocks, &order, max_wire_length, &mut trace);
+            // the session's timer as the repair leaves it: every net it left invalid estimated now
+            // (`ensureWireParasitic` on each), as the next search would
+            let held = match &r {
+                Ok(_) if std::env::var_os("VYGES_CTS_FRESH_BALANCER").is_none() => {
+                    use vyges_rsz::design::Design as _;
+                    let invalid: Vec<String> = design.invalid.iter().cloned().collect();
+                    let mut ok = true;
+                    for n in &invalid {
+                        ok &= design.ensure_wire_parasitic(n).is_ok();
+                    }
+                    ok.then(|| HeldTiming { parasitics: std::mem::take(&mut design.parasitics[0]), constants: design.constants.clone() })
+                }
+                _ => None,
+            };
+            (r, held)
         };
         if let Ok(path) = std::env::var("VYGES_CTS_RSZ_TRACE") {
             let _ = std::fs::write(&path, trace.text());
         }
         self.refresh();
         self.clock_arrivals = None;
+        self.held_timing = held;
         match r {
             Ok(outcome) => {
                 for (code, msg) in outcome.clk_summary() {
@@ -1448,4 +1508,30 @@ mod descriptor_args_tests {
             assert_eq!(used, props, "{}: command line vs advertised inputs", op["name"]);
         }
     }
+}
+
+/// A fresh estimate's first-scene parasitics and a fresh simulation's constants.
+type FreshTiming = (HashMap<String, vyges_sta::graph::NetParasitics>, HashMap<String, bool>);
+
+/// The timer state `repair_clock_nets` hands the latency balancer (see `CliDesign::held_timing`).
+struct HeldTiming {
+    parasitics: HashMap<String, vyges_sta::graph::NetParasitics>,
+    constants: HashMap<String, bool>,
+}
+
+/// `VYGES_CTS_CHECK_HELD`: the held state against a fresh estimate and simulation — the same
+/// constants, the same nets, each with the same network. (A held set without the nets the repair
+/// left invalid fails here: 60 nets missing on the repair_clock_nets case.)
+fn check_held(h: &HeldTiming, fresh: &HashMap<String, vyges_sta::graph::NetParasitics>, constants: &HashMap<String, bool>) -> Result<(), String> {
+    if &h.constants != constants {
+        return Err(format!("held timing: the constants differ from a fresh simulation ({} held, {} fresh)", h.constants.len(), constants.len()));
+    }
+    let differ: Vec<&String> = fresh.iter().filter(|(n, p)| h.parasitics.get(*n).is_some_and(|q| format!("{q:?}") != format!("{p:?}"))).map(|(n, _)| n).take(5).collect();
+    let missing = fresh.keys().filter(|n| !h.parasitics.contains_key(*n)).count();
+    let extra = h.parasitics.keys().filter(|n| !fresh.contains_key(*n)).count();
+    eprintln!("VYGCTS|check_held|fresh {}|held {}|missing {missing}|extra {extra}|differ {:?}", fresh.len(), h.parasitics.len(), differ);
+    if !differ.is_empty() || missing > 0 || extra > 0 {
+        return Err(format!("held timing: parasitics differ from a fresh estimate ({missing} nets missing, {extra} extra, differing {differ:?})"));
+    }
+    Ok(())
 }
