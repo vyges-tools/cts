@@ -123,8 +123,9 @@ struct CliDesign {
     /// set_cts_config's clock buffer string or footprint (findBuffers' clock test reads it).
     clock_pattern: vyges_rsz::preamble::ClockPattern,
     masters: HashSet<String>,
-    /// `dbNet` ids by name (the block's net order).
-    net_ids: HashMap<String, u32>,
+    /// `dbNet` ids by name (the block's net order), read from the database when first asked after
+    /// a [`CliDesign::refresh`] ([`CliDesign::net_ids`]), not at every refresh.
+    net_ids: std::cell::OnceCell<HashMap<String, u32>>,
     bterms: HashSet<String>,
     /// The SDC has `set_max_fanout` on something other than the design (not modelled).
     sdc_max_fanout: bool,
@@ -151,7 +152,7 @@ struct CliDesign {
 
 impl CliDesign {
     fn empty() -> CliDesign {
-        CliDesign { db: Db::new(), libs: Vec::new(), lib_paths: Vec::new(), scenes: Vec::new(), cmd_scene: None, scene_cmds: Vec::new(), rc: vyges_est::rc::Rc::new(), tech: String::new(), clocks: Vec::new(), modes: Vec::new(), cur_mode: None, dont_use: BTreeSet::new(), set_dont_use: BTreeSet::new(), routing_alpha_set: false, clock_pattern: Default::default(), masters: HashSet::new(), net_ids: HashMap::new(), bterms: HashSet::new(), sdc_max_fanout: false, default_fanout: FanoutLimits::default(), mode_fanout: Vec::new(), liberty: vyges_est::liberty::LibertyClocks::default(), sdc: None, clock_arrivals: None, held_timing: None, constant_check: None }
+        CliDesign { db: Db::new(), libs: Vec::new(), lib_paths: Vec::new(), scenes: Vec::new(), cmd_scene: None, scene_cmds: Vec::new(), rc: vyges_est::rc::Rc::new(), tech: String::new(), clocks: Vec::new(), modes: Vec::new(), cur_mode: None, dont_use: BTreeSet::new(), set_dont_use: BTreeSet::new(), routing_alpha_set: false, clock_pattern: Default::default(), masters: HashSet::new(), net_ids: std::cell::OnceCell::from(HashMap::new()), bterms: HashSet::new(), sdc_max_fanout: false, default_fanout: FanoutLimits::default(), mode_fanout: Vec::new(), liberty: vyges_est::liberty::LibertyClocks::default(), sdc: None, clock_arrivals: None, held_timing: None, constant_check: None }
     }
 
     /// `define_scene name [-mode m] -liberty {libs}`: a scene of libraries already read, named by
@@ -279,9 +280,32 @@ impl CliDesign {
     fn refresh(&mut self) {
         self.held_timing = None;
         self.masters = (0..self.db.num_masters().unwrap_or(0)).filter_map(|i| self.db.nth_master_name(i).ok()).collect();
-        self.net_ids = self.db.block_get_nets().into_iter().enumerate().map(|(i, n)| (n, i as u32)).collect();
+        // 🔑 read when first asked, not here: the latency balancer refreshes after every delay
+        // buffer and asks for no net id in between, and each read lists every net of the block.
+        // Everything that edits the net list without a refresh reads it first ([`Self::net_ids_mut`]),
+        // so the map is the one an immediate read would give.
+        self.net_ids = std::cell::OnceCell::new();
         self.bterms = self.db.block_get_b_terms().into_iter().collect();
+        if std::env::var_os("VYGES_CTS_EAGER_NET_IDS").is_some() {
+            self.net_ids();
+        }
     }
+
+    /// The block's `dbNet` ids by name, read from the database once per [`Self::refresh`].
+    fn net_ids(&self) -> &HashMap<String, u32> {
+        self.net_ids.get_or_init(|| net_ids_of(self.db.block_get_nets()))
+    }
+
+    /// [`Self::net_ids`], to edit with the database.
+    fn net_ids_mut(&mut self) -> &mut HashMap<String, u32> {
+        self.net_ids();
+        self.net_ids.get_mut().expect("read just above")
+    }
+}
+
+/// Each net's id: its place in the block's net order.
+fn net_ids_of(nets: Vec<String>) -> HashMap<String, u32> {
+    nets.into_iter().enumerate().map(|(i, n)| (n, i as u32)).collect()
 }
 
 impl BufferLibs for CliDesign {
@@ -304,7 +328,7 @@ impl BufferLibs for CliDesign {
 
 impl ClockDesign for CliDesign {
     fn net_id(&self, net: &str) -> u32 {
-        self.net_ids.get(net).copied().unwrap_or(u32::MAX)
+        self.net_ids().get(net).copied().unwrap_or(u32::MAX)
     }
     fn net_iterms(&self, net: &str) -> Vec<ITerm> {
         self.db.net_get_i_terms(net).iter().map(|s| split_iterm(s)).collect()
@@ -499,27 +523,31 @@ impl vyges_cts::write::TreeDb for CliDesign {
         self.db.inst_set_placement_status(name, "PLACED").map_err(e)
     }
     fn destroy_pin_mod_net(&mut self, inst: &str, pin: &str) -> Res<bool> {
+        self.net_ids_mut();
         self.db.destroy_pin_mod_net(inst, pin).map_err(|e| Stop::Refused(format!("{inst}/{pin}: {e}")))
     }
     fn hierarchical_connect(&mut self, src: &ITerm, dst: &ITerm, name: &str) -> Res<()> {
+        self.net_ids_mut();
         self.db.hierarchical_connect(&src.0, &src.1, &dst.0, &dst.1, name).map_err(|e| Stop::Refused(format!("hierarchicalConnect {name}: {e}")))
     }
     fn create_clock_net(&mut self, name: &str) -> Res<()> {
         let e = |e: vyges_opendb::Error| Stop::Refused(format!("create net {name}: {e}"));
-        if self.net_ids.contains_key(name) {
+        if self.net_ids_mut().contains_key(name) {
             return vyges_cts::log::refuse(format!("net {name} already exists (the reference's create would fail)"));
         }
         self.db.create_net(name).map_err(e)?;
         self.db.net_set_sig_type(name, "CLOCK").map_err(e)?;
-        self.net_ids.insert(name.to_string(), self.net_ids.len() as u32);
+        let ids = self.net_ids_mut();
+        ids.insert(name.to_string(), ids.len() as u32);
         Ok(())
     }
     fn set_net_clock(&mut self, net: &str) -> Res<()> {
         self.db.net_set_sig_type(net, "CLOCK").map_err(|e| Stop::Refused(format!("{net}: {e}")))
     }
     fn destroy_net(&mut self, net: &str) -> Res<()> {
+        self.net_ids_mut();
         self.db.destroy_net(net).map_err(|e| Stop::Refused(format!("destroy {net}: {e}")))?;
-        self.net_ids.remove(net);
+        self.net_ids_mut().remove(net);
         Ok(())
     }
     fn destroy_inst(&mut self, inst: &str) -> Res<()> {
@@ -906,7 +934,7 @@ impl Design for CliDesign {
         self.libs.iter().any(|l| l.name == name)
     }
     fn find_net(&self, name: &str) -> Option<String> {
-        self.net_ids.contains_key(name).then(|| name.to_string())
+        self.net_ids().contains_key(name).then(|| name.to_string())
     }
     fn sdc_clocks(&self) -> Vec<SdcClock> {
         self.clocks.clone()
@@ -1583,6 +1611,44 @@ mod tests {
         d.constant_check = Some("c.sdc".into());
         assert!(d.check_constants_off_clock().is_ok());
         assert_eq!(d.constant_check, None);
+    }
+
+    /// Rule (OpenDB `dbNet::getId`: a net's id as the block holds it when asked; the CTS reference
+    /// asks after each edit): the id map read when first asked after a refresh is the one the
+    /// refresh would have read, and a net created or destroyed before that first ask is taken in
+    /// the order the database saw it, as with a map read at the refresh.
+    #[test]
+    fn the_net_ids_read_late_are_the_ones_a_refresh_read() {
+        let dir = std::env::temp_dir().join(format!("cts-net-ids-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lef = "VERSION 5.8 ;\nUNITS\n  DATABASE MICRONS 1000 ;\nEND UNITS\nLAYER M1\n  TYPE ROUTING ;\n  DIRECTION HORIZONTAL ;\n  PITCH 0.2 ;\n  WIDTH 0.1 ;\nEND M1\nEND LIBRARY\n";
+        let def = "VERSION 5.8 ;\nDESIGN t ;\nUNITS DISTANCE MICRONS 1000 ;\nDIEAREA ( 0 0 ) ( 10000 10000 ) ;\nNETS 3 ;\n- a ;\n- b ;\n- c ;\nEND NETS\nEND DESIGN\n";
+        std::fs::write(dir.join("t.lef"), lef).unwrap();
+        std::fs::write(dir.join("t.def"), def).unwrap();
+        let mut d = CliDesign::empty();
+        d.db.read_lef(dir.join("t.lef")).unwrap();
+        d.db.read_def(dir.join("t.def"), "full").unwrap();
+        d.refresh();
+        let at_refresh = net_ids_of(d.db.block_get_nets());
+        assert_eq!(at_refresh.len(), 3, "the three nets read");
+        assert_eq!(d.net_ids(), &at_refresh, "read late: the map the refresh would have read");
+        // an edit with a refresh (as each delay buffer): the next ask reads the edited block
+        d.db.create_net("d").unwrap();
+        d.refresh();
+        assert_eq!(d.net_ids(), &net_ids_of(d.db.block_get_nets()));
+        assert_eq!(d.net_id("d"), 3);
+        // an edit WITHOUT a refresh, before the first ask: as on a map read at the refresh
+        d.refresh();
+        let before = net_ids_of(d.db.block_get_nets());
+        vyges_cts::write::TreeDb::destroy_net(&mut d, "b").unwrap();
+        let mut want = before.clone();
+        want.remove("b");
+        assert_eq!(d.net_ids(), &want, "the destroyed net gone, every other id as at the refresh");
+        vyges_cts::write::TreeDb::create_clock_net(&mut d, "e").unwrap();
+        want.insert("e".into(), want.len() as u32);
+        assert_eq!(d.net_ids(), &want);
+        assert!(vyges_cts::write::TreeDb::create_clock_net(&mut d, "e").is_err(), "a second e is refused");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
