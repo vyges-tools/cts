@@ -59,7 +59,7 @@ pub fn balance_macro_register_latencies(log: &mut Log, d: &mut dyn TreeDb, o: &B
     }
     let mut total = 0i32;
     for i in (0..trees.len()).rev() {
-        if trees[i].parent.is_none() && trees[i].has_children {
+        if is_balanced_root(trees[i].parent, trees[i].has_children) {
             let mut b = Balancer { o, trees, root: i, graph: Vec::new(), inst_to_tree: HashMap::new(), worse_delay: f32::MIN_POSITIVE, dly_buffers: Vec::new(), buffers_delay: Vec::new(), delay_buf_index: 0 };
             total += b.run(log, d, &legalizers[i])? as i32;
         }
@@ -68,6 +68,21 @@ pub fn balance_macro_register_latencies(log: &mut Log, d: &mut dyn TreeDb, o: &B
         log.info("CTS", 37, format!("Total number of delay buffers: {total}"));
     }
     Ok(total)
+}
+
+/// `runLatencyBalancers`' builder test: a root (no parent) with children gets a balancer.
+fn is_balanced_root(parent: Option<usize>, has_children: bool) -> bool {
+    parent.is_none() && has_children
+}
+
+/// Does a latency balancer run after the trees (and so read the clock arrivals)? Insertion delay
+/// on and some root tree with children ([`balance_macro_register_latencies`]).
+pub fn balancer_follows(insertion_delay: bool, trees: &[Tree]) -> bool {
+    balancer_follows_over(insertion_delay, trees.iter().map(|t| (t.parent, t.has_children)))
+}
+
+fn balancer_follows_over(insertion_delay: bool, mut roots: impl Iterator<Item = (Option<usize>, bool)>) -> bool {
+    insertion_delay && roots.any(|(p, c)| is_balanced_root(p, c))
 }
 
 /// `TechChar::computeBufferDelay`: the driver's rise→rise gate delay into `load_cap` (plus the
@@ -658,6 +673,18 @@ mod tests {
         assert_eq!(pick_best_chain(&dp, n, 4, 2), (1, 0));
         // Nothing nearer than the empty chain: none.
         assert_eq!(pick_best_chain(&vec![-1; 5 * n], n, 4, 2), (0, -1));
+    }
+
+    /// Rule (OpenROAD `TritonCTS::runTritonCts`: `repairClockNets()` then
+    /// `balanceMacroRegisterLatencies()`, which runs a `LatencyBalancer` — whose `initSta` reads
+    /// the clock arrivals off the repaired timer — only with insertion delay on, per builder with
+    /// no parent and some children): the repair hands over its arrival table only then.
+    #[test]
+    fn the_balancer_follows_the_repair_only_for_a_root_with_children_under_insertion_delay() {
+        assert!(balancer_follows_over(true, [(None, false), (Some(0), false), (None, true)].into_iter()));
+        assert!(!balancer_follows_over(false, [(None, true)].into_iter()), "insertion delay off: no balancer");
+        assert!(!balancer_follows_over(true, [(None, false), (Some(0), true)].into_iter()), "no root with children");
+        assert!(!balancer_follows_over(true, std::iter::empty()));
     }
 
     /// Rule (`propagateClock`): a sequential cell passes the clock only at a clock-gate clock pin

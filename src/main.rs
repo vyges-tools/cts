@@ -637,36 +637,9 @@ impl CliDesign {
             g.find_delays(&par0, None)?;
             mark("delays");
             let time_scale = libs.default_library().ok_or("no liberty library")?.time_scale;
-            // `setAllClocksPropagated` after the constraints were read: every real clock
-            // propagated (its network latency removed), virtual clocks kept ideal with theirs;
-            // the constraints as the mode's timer reads them (uncertainties, exceptions, groups).
-            let ssdc = vyges_sta::scenes::mode_search_sdc(&s, &netlist, time_scale, true)?;
-            let mut search = vyges_sta::search::Search::in_graph_order(&g, &ssdc);
-            // `ensureClkArrivals` ("Only clock arrivals at the sinks are read; data arrivals are
-            // not"): the clock network searched alone, to the register clock pins
-            // (`Search::findClkArrivals`); a sink's paths are the full search's.
-            search.find_clk_arrivals()?;
+            let rows = clock_arrival_rows(&g, &s, &netlist, time_scale)?;
             mark("arrivals");
-            let mut out: HashMap<String, Vec<(f32, String)>> = HashMap::new();
-            for v in 0..g.vertices.len() {
-                for p in &search.paths[v] {
-                    let (Some(edge), 1) = (p.tag.clk_edge, p.tag.mm) else { continue };
-                    if edge % 2 != 0 {
-                        continue;
-                    }
-                    // The clock path's start (`PathExpanded::startPath`) and its net.
-                    let (mut sv, mut sp) = (v, p);
-                    while let Some((pv, pp)) = search.prev_path(sp) {
-                        (sv, sp) = (pv, pp);
-                    }
-                    let start = &g.vname(sv);
-                    let net = match start.rsplit_once('/') {
-                        Some((i, pin)) => self.db.iterm_get_net(i, pin),
-                        None => self.db.bterm_get_net(start),
-                    };
-                    out.entry(g.vname(v)).or_default().push((p.arrival, net));
-                }
-            }
+            let out = self.arrival_rows_table(rows);
             mark("table");
             Ok(out)
         })();
@@ -679,6 +652,53 @@ impl CliDesign {
     }
 }
 
+impl CliDesign {
+    /// [`clock_arrival_rows`] keyed by sink pin, each clock path's start pin replaced by its net.
+    fn arrival_rows_table(&self, rows: Vec<(String, f32, String)>) -> HashMap<String, Vec<(f32, String)>> {
+        let mut out: HashMap<String, Vec<(f32, String)>> = HashMap::new();
+        for (pin, arrival, start) in rows {
+            let net = match start.rsplit_once('/') {
+                Some((i, p)) => self.db.iterm_get_net(i, p),
+                None => self.db.bterm_get_net(&start),
+            };
+            out.entry(pin).or_default().push((arrival, net));
+        }
+        out
+    }
+}
+
+/// The latency balancer's `initSta` reads on a timed graph `g`: per vertex in graph order, each max
+/// path of a rising clock edge, as `(vertex, arrival, the clock path's start pin)`.
+///
+/// `setAllClocksPropagated` after the constraints were read: every real clock propagated (its
+/// network latency removed), virtual clocks kept ideal with theirs; the constraints as the mode's
+/// timer reads them (uncertainties, exceptions, groups). `s` is the balancer's reading of the SDC
+/// (`set_propagated_clock` taken out, `[all_inputs]` / `[all_outputs]` delays as their ports).
+fn clock_arrival_rows(g: &vyges_sta::graph::Graph<'_>, s: &vyges_loom::sdc::Sdc, netlist: &vyges_sta::netlist::Netlist, time_scale: f32) -> Result<Vec<(String, f32, String)>, String> {
+    let ssdc = vyges_sta::scenes::mode_search_sdc(s, netlist, time_scale, true)?;
+    let mut search = vyges_sta::search::Search::in_graph_order(g, &ssdc);
+    // `ensureClkArrivals` ("Only clock arrivals at the sinks are read; data arrivals are not"):
+    // the clock network searched alone, to the register clock pins (`Search::findClkArrivals`);
+    // a sink's paths are the full search's.
+    search.find_clk_arrivals()?;
+    let mut rows = Vec::new();
+    for v in 0..g.vertices.len() {
+        for p in &search.paths[v] {
+            let (Some(edge), 1) = (p.tag.clk_edge, p.tag.mm) else { continue };
+            if edge % 2 != 0 {
+                continue;
+            }
+            // The clock path's start (`PathExpanded::startPath`).
+            let (mut sv, mut sp) = (v, p);
+            while let Some((pv, pp)) = search.prev_path(sp) {
+                (sv, sp) = (pv, pp);
+            }
+            rows.push((g.vname(v), p.arrival, g.vname(sv)));
+        }
+    }
+    Ok(rows)
+}
+
 impl vyges_cts::techchar::CharDesign for CliDesign {
     fn master_height(&self, name: &str) -> i32 {
         self.db.master_get_height(name) as i32
@@ -687,7 +707,7 @@ impl vyges_cts::techchar::CharDesign for CliDesign {
 
 impl CliDesign {
     /// `Resizer::repairClkNets` on the written design, with the constraints as read.
-    fn repair_clk_nets_with(&mut self, s: &vyges_loom::sdc::Sdc, log: &mut Log, clk_buffers: &[String], max_wire_length: f64) -> Res<()> {
+    fn repair_clk_nets_with(&mut self, s: &vyges_loom::sdc::Sdc, log: &mut Log, clk_buffers: &[String], max_wire_length: f64, balancer_follows: bool) -> Res<()> {
         use vyges_rsz::env::{constant_values, constants_by_name, constants_off_clock_networks_given, master_pins, no_signal_cap, placement_parasitics_held, port_caps_at, sdc_constraints, sdc_env};
         use vyges_rsz::odb_design::{net_info, sdc_cap_pins, sdc_port_cap_limits, sizing_limits, CliDesign as RszDesign};
         let refused = |e: String| Stop::Refused(format!("repair_clock_nets: {e}"));
@@ -715,9 +735,22 @@ impl CliDesign {
         let clock_sources: Vec<String> = s.clocks.iter().filter(|c| !c.is_virtual()).flat_map(|c| c.sources.iter().cloned()).collect();
         let clocks: Vec<Vec<String>> = s.clocks.iter().map(|c| c.sources.clone()).collect();
         let netlist = vyges_grt::timer::netlist(&self.db);
+        // The latency balancer's reading of the constraints, for its arrival table on the
+        // repair's own graph (see `repair_clk_nets_then` below): `set_propagated_clock` taken out
+        // (every real clock is), `[all_inputs]` / `[all_outputs]` delays as their ports (a clock
+        // repair adds no port). `VYGES_CTS_FRESH_BALANCER`: the balancer times afresh.
+        let balancer_sdc = (balancer_follows && std::env::var_os("VYGES_CTS_FRESH_BALANCER").is_none()).then(|| {
+            let mut b = s.clone();
+            b.propagated = Vec::new();
+            vyges_rsz::env::expand_io_delay_ports(&mut b, &netlist);
+            b
+        });
+        let time_scale = lib0.time_scale;
         let mut rc = self.rc.clone();
         rc.sort_clk_and_signal_layers();
         let caps = port_caps_at(None, Some(s), &libs, &netlist).map_err(refused)?;
+        // `VYGES_RSZ_STAGES`: a `VYGSTAGE` line at each step of this setup (the top-down table)
+        vyges_rsz::stage("rcn_setup_start");
         // 🔑 ONE logic simulation per constraint set and ONE clock-network walk for this design
         // state, shared by the estimate's skips, the constants-off-clock check and the resizer's
         // held skips — the reference's `Sim` and `ClkNetwork` are computed once and read by all
@@ -725,8 +758,11 @@ impl CliDesign {
         // ran its own: five simulations and three walks before the first repair.
         let timing = vyges_est::placement::Timing { liberty: Some(&self.liberty), clock_sources: clock_sources.clone(), propagated: true };
         let without = constant_values(&self.db, &self.liberty).map_err(refused)?;
+        vyges_rsz::stage("rcn_sim");
         let base_skips = vyges_est::placement::skips_with_constants(&self.db, &timing, &without).map_err(|e| refused(e.to_string()))?;
+        vyges_rsz::stage("rcn_clock_walk");
         let parasitics = placement_parasitics_held(&self.db, &rc, &self.liberty, &clock_sources, true, 0.3, libs.scene_count(), &caps, Some(&base_skips)).map_err(refused)?;
+        vyges_rsz::stage("rcn_estimate");
         let wire_rc: Vec<vyges_rsz::buffered_net::WireRc> = (0..libs.scene_count().max(1))
             .map(|k| {
                 let v = rc.resolved(&self.tech, k);
@@ -748,6 +784,7 @@ impl CliDesign {
         // the resizer's held skips (its `fresh_skips`: these constants, the same clock walk)
         let held_skips = base_skips.with_constants(&constant_values, &timing);
         drop(timing);
+        vyges_rsz::stage("rcn_constants_check");
         let constants = constants_by_name(constant_values);
         let mut env = sdc_env(s, &libs, &netlist).map_err(refused)?;
         env.constants = constants.clone();
@@ -777,7 +814,9 @@ impl CliDesign {
             m
         };
         let liberty = self.liberty.clone();
+        vyges_rsz::stage("rcn_env_names");
         let mut trace = vyges_rsz::trace::Trace::default();
+        let mut rows: Option<Vec<(String, f32, String)>> = None;
         let (r, held) = {
             let mut design = RszDesign { constants, constraints, estimating, core, port_caps, propagated: true, sdc_pins: sdc_cap_pins(s), ..RszDesign::new(&mut self.db, &rc, &liberty, &libs, &clock_sources, netlist, parasitics, info) };
             if std::env::var_os("VYGES_CTS_FRESH_SKIPS").is_none() {
@@ -785,7 +824,21 @@ impl CliDesign {
             }
             let inputs = vyges_rsz::repair_design::Inputs { libs: &libs, masters: &masters, dont_use: &dont_use, limits, clock_sources: &clock_sources, dbu, wire_rc, sdc: env, master_pins: mpins, sizing_limits: block_limits, clock_pattern: self.clock_pattern.clone() };
             let order = |p: &str| ids.get(p).copied().unwrap_or(u64::MAX);
-            let r = vyges_rsz::repair_design::repair_clk_nets(&inputs, &mut design, clk_buffers, &clocks, &order, max_wire_length, &mut trace);
+            vyges_rsz::stage("rcn_design");
+            // 🔑 The balancer's clock arrivals read off the repair's own first-scene graph, its
+            // delays found incrementally after the last edit — not a new graph timed whole.
+            // Reference rule (OpenROAD `LatencyBalancer::initSta`: `ensureGraph`,
+            // `ensureClkNetwork`, `ensureClkArrivals` = `searchPreamble` (an incremental
+            // `findDelays()`) + `findClkArrivals`, on the one `Sta` `repairClkNets` just edited).
+            let mut after = |g: &vyges_sta::graph::Graph<'_>| -> Result<(), String> {
+                if let Some(b) = &balancer_sdc {
+                    rows = Some(clock_arrival_rows(g, b, &g.netlist, time_scale)?);
+                }
+                Ok(())
+            };
+            let after: Option<vyges_rsz::repair_design::AfterRepair<'_>> = if balancer_sdc.is_some() { Some(&mut after) } else { None };
+            let r = vyges_rsz::repair_design::repair_clk_nets_then(&inputs, &mut design, clk_buffers, &clocks, &order, max_wire_length, &mut trace, after);
+            vyges_rsz::stage("rcn_repair");
             // the session's timer as the repair leaves it: every net it left invalid estimated now
             // (`ensureWireParasitic` on each), as the next search would
             let held = match &r {
@@ -796,6 +849,7 @@ impl CliDesign {
                     for n in &invalid {
                         ok &= design.ensure_wire_parasitic(n).is_ok();
                     }
+                    vyges_rsz::stage("rcn_held_estimate");
                     ok.then(|| HeldTiming { parasitics: std::mem::take(&mut design.parasitics[0]), constants: design.constants.clone() })
                 }
                 _ => None,
@@ -806,7 +860,11 @@ impl CliDesign {
             let _ = std::fs::write(&path, trace.text());
         }
         self.refresh();
-        self.clock_arrivals = None;
+        // the table read off the repair's graph, when it was (a failed repair reads none)
+        self.clock_arrivals = match (&r, rows) {
+            (Ok(_), Some(rows)) => Some(self.arrival_rows_table(rows)),
+            _ => None,
+        };
         self.held_timing = held;
         match r {
             Ok(outcome) => {
@@ -860,10 +918,19 @@ impl Design for CliDesign {
             self.modes.iter().map(|(_, c)| c.clone()).collect()
         }
     }
-    fn repair_clk_nets(&mut self, log: &mut Log, clk_buffers: &[String], max_wire_length: f64) -> Res<()> {
+    fn repair_clk_nets(&mut self, log: &mut Log, clk_buffers: &[String], max_wire_length: f64, balancer_follows: bool) -> Res<()> {
         let s = self.sdc.take().ok_or_else(|| Stop::Refused("repair_clock_nets without constraints: not modelled".into()))?;
-        let r = self.repair_clk_nets_with(&s, log, clk_buffers, max_wire_length);
+        let r = self.repair_clk_nets_with(&s, log, clk_buffers, max_wire_length, balancer_follows);
         self.sdc = Some(s);
+        // `VYGES_CTS_CHECK_HELD`: the table read off the repair's graph against the balancer's
+        // own graph timed whole on the same state.
+        if r.is_ok() && std::env::var_os("VYGES_CTS_CHECK_HELD").is_some() {
+            if let Some(held) = self.clock_arrivals.take() {
+                let fresh = self.clock_arrival_table().map_err(Stop::Refused)?;
+                check_arrival_tables(&held, &fresh).map_err(Stop::Refused)?;
+                self.clock_arrivals = Some(held);
+            }
+        }
         r
     }
     fn find_max_wire_length(&self) -> Res<f64> {
@@ -1573,6 +1640,21 @@ type FreshTiming = (HashMap<String, vyges_sta::graph::NetParasitics>, HashMap<St
 struct HeldTiming {
     parasitics: HashMap<String, vyges_sta::graph::NetParasitics>,
     constants: HashMap<String, bool>,
+}
+
+/// `VYGES_CTS_CHECK_HELD`: the clock arrival table read off the repair's graph against one from a
+/// graph timed whole — the same sinks, each with the same arrivals (bit for bit) and nets in order.
+fn check_arrival_tables(held: &HashMap<String, Vec<(f32, String)>>, fresh: &HashMap<String, Vec<(f32, String)>>) -> Result<(), String> {
+    let same = |a: &[(f32, String)], b: &[(f32, String)]| a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.0.to_bits() == y.0.to_bits() && x.1 == y.1);
+    let mut differ: Vec<&String> = fresh.iter().filter(|(p, v)| held.get(*p).is_some_and(|h| !same(h, v))).map(|(p, _)| p).collect();
+    differ.sort();
+    let missing = fresh.keys().filter(|p| !held.contains_key(*p)).count();
+    let extra = held.keys().filter(|p| !fresh.contains_key(*p)).count();
+    eprintln!("VYGCTS|check_arrivals|fresh {}|held {}|missing {missing}|extra {extra}|differ {}|{:?}", fresh.len(), held.len(), differ.len(), differ.iter().take(5).collect::<Vec<_>>());
+    if !differ.is_empty() || missing > 0 || extra > 0 {
+        return Err(format!("held clock arrivals: differ from a graph timed whole ({missing} sinks missing, {extra} extra, {} differing)", differ.len()));
+    }
+    Ok(())
 }
 
 /// `VYGES_CTS_CHECK_HELD`: the held state against a fresh estimate and simulation — the same

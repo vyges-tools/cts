@@ -41,7 +41,8 @@ pub trait Design: ClockDesign + BufferLibs + crate::techchar::CharDesign + crate
     /// `Resizer::repairClkNets(max_wire_length)` on the written design, every clock propagated:
     /// long wires in each clock's network repaired with the clock buffers (`clk_buffers_`),
     /// nothing else; its RSZ-0047 / RSZ-0048 lines into `log`. Refused where not modelled.
-    fn repair_clk_nets(&mut self, _log: &mut Log, _clk_buffers: &[String], _max_wire_length: f64) -> Res<()> {
+    /// `balancer_follows`: the latency balancer runs next and reads the clock arrivals.
+    fn repair_clk_nets(&mut self, _log: &mut Log, _clk_buffers: &[String], _max_wire_length: f64, _balancer_follows: bool) -> Res<()> {
         refuse("-repair_clock_nets is not modelled")
     }
     /// The non-via shapes of an instance terminal (`dbITermShapeItr`), placed: `(x0, y0, x1, y1)`.
@@ -199,7 +200,10 @@ fn run_stages(o: &mut Options, log: &mut Log, d: &mut dyn Design) -> Res<Outcome
     if o.other.get("repair_clock_nets").is_some_and(|v| v == "true") {
         let max_wire_length = d.find_max_wire_length()?;
         if max_wire_length > 0.0 {
-            d.repair_clk_nets(log, &o.buffer_list, max_wire_length)?;
+            // `balanceMacroRegisterLatencies` runs a balancer (which reads the clock arrivals) per
+            // root tree with children, when insertion delay is on
+            let balancer_follows = crate::latency::balancer_follows(o.insertion_delay, &trees);
+            d.repair_clk_nets(log, &o.buffer_list, max_wire_length, balancer_follows)?;
         }
     }
     let unit = f64::from(d.dbu());
